@@ -8,15 +8,20 @@
 # board up to the standard lab image.
 #
 # Stages (run in this order by default):
-#   1. display-fix  Force 1920x1080@60 on DP-1 at the greeter AND inside
-#                    the XFCE desktop session (two independent EDID
-#                    workarounds -- see stage_display_fix() for why both
-#                    are needed).
-#   2. zsh           Install zsh + zsh-autosuggestions + zsh-syntax-
-#                    highlighting, make it the login shell, deploy .zshrc.
-#   3. motd          Install the NIVROKU /etc/motd banner.
-#   4. tools         apt update && full-upgrade, install fastfetch +
-#                    sysbench.
+#   1. display-fix     Force 1920x1080@60 on DP-1 at the greeter AND inside
+#                       the XFCE desktop session (two independent EDID
+#                       workarounds -- see stage_display_fix() for why both
+#                       are needed).
+#   2. xfce-shortcuts   Remap the window-tiling keyboard shortcuts from
+#                       Super+<keypad arrow> to Super+<arrow>, whatever
+#                       command is currently bound to each -- see
+#                       stage_xfce_shortcuts() for why this is done as a
+#                       live discover-and-migrate rather than hardcoded.
+#   3. zsh              Install zsh + zsh-autosuggestions + zsh-syntax-
+#                       highlighting, make it the login shell, deploy .zshrc.
+#   4. motd             Install the NIVROKU /etc/motd banner.
+#   5. tools            apt update && full-upgrade, install fastfetch,
+#                       sysbench, btop, and flashrom.
 #
 # REQUIREMENTS
 #   * Run as your normal desktop user -- NOT as root, NOT via sudo.
@@ -299,6 +304,70 @@ SYSTEMD_UNIT
 }
 
 # ============================================================
+# Stage: xfce-shortcuts
+# ============================================================
+#
+# Moves the window-tiling keyboard shortcuts off the numpad. On this
+# image they're currently bound to Super+<keypad arrow> (xfconf keysyms
+# KP_Up/KP_Down/KP_Left/KP_Right); the goal is Super+<arrow> instead,
+# with no keypad involved, same tiling behavior as before.
+#
+# This is deliberately NOT a fixed list of "old value -> new value"
+# xfconf-query calls. Whatever command each Super+KP_<dir> is currently
+# bound to (in either the /commands/custom/... or /xfwm4/custom/...
+# subtree -- XFCE splits "Application Shortcuts" from "Window Manager"
+# actions between those) gets read live and copied onto the matching
+# Super+<dir> property, then the keypad property is removed. That's
+# correct regardless of exactly what command string is behind each key
+# on a given flash, and re-running it is a no-op once migrated.
+
+stage_xfce_shortcuts() {
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "/run/user/$(id -u)/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+  fi
+
+  if ! command -v xfconf-query >/dev/null 2>&1 || ! xfconf-query -c xfce4-keyboard-shortcuts -l >/dev/null 2>&1; then
+    warn "No live XFCE session detected (running over SSH?)."
+    warn "Re-run: $SCRIPT_NAME --only xfce-shortcuts from a terminal INSIDE the desktop session."
+    return 0
+  fi
+
+  local channel="xfce4-keyboard-shortcuts"
+  local prop value new_prop existing remapped=0
+
+  while IFS= read -r prop; do
+    case "$prop" in
+      *"<Super>KP_Up")    new_prop="${prop/KP_Up/Up}" ;;
+      *"<Super>KP_Down")  new_prop="${prop/KP_Down/Down}" ;;
+      *"<Super>KP_Left")  new_prop="${prop/KP_Left/Left}" ;;
+      *"<Super>KP_Right") new_prop="${prop/KP_Right/Right}" ;;
+      *) continue ;;
+    esac
+
+    value="$(xfconf-query -c "$channel" -p "$prop")"
+
+    existing="$(xfconf-query -c "$channel" -p "$new_prop" 2>/dev/null || true)"
+    if [[ -n "$existing" && "$existing" != "$value" ]]; then
+      warn "$new_prop already has a different binding (\"$existing\") -- overwriting with \"$value\" from $prop"
+    fi
+
+    log "Remapping shortcut: $prop -> $new_prop  (command: $value)"
+    xfconf-query -c "$channel" -p "$new_prop" -n -t string -s "$value" 2>/dev/null || \
+    xfconf-query -c "$channel" -p "$new_prop" -s "$value"
+    xfconf-query -c "$channel" -p "$prop" -r
+    remapped=$((remapped + 1))
+  done < <(xfconf-query -c "$channel" -l)
+
+  if [[ "$remapped" -eq 0 ]]; then
+    log "No Super+<keypad arrow> shortcuts found in $channel -- already migrated, or this flash uses a different binding scheme."
+  else
+    log "Remapped $remapped shortcut(s) from Super+<keypad arrow> to Super+<arrow>."
+  fi
+
+  hint "Verify: xfconf-query -c xfce4-keyboard-shortcuts -l -v | grep -E '<Super>(Up|Down|Left|Right|KP_)'"
+}
+
+# ============================================================
 # Stage: zsh
 # ============================================================
 
@@ -448,11 +517,14 @@ stage_tools() {
   sudo apt full-upgrade -y 2>&1 | tee -a "$LOG_DIR/updates.log"
   APT_UPDATED=1
 
-  log "Ensuring sysbench + fastfetch are installed"
+  log "Ensuring sysbench, btop, flashrom, and fastfetch are installed"
 
-  if ! command -v sysbench >/dev/null; then
-    sudo apt install -y sysbench 2>&1 | tee -a "$LOG_DIR/updates.log"
-  fi
+  local pkg
+  for pkg in sysbench btop flashrom; do
+    if ! command -v "$pkg" >/dev/null 2>&1; then
+      sudo apt install -y "$pkg" 2>&1 | tee -a "$LOG_DIR/updates.log"
+    fi
+  done
 
   if ! command -v fastfetch >/dev/null; then
     local fastfetch_url="https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-aarch64.deb"
@@ -467,17 +539,19 @@ stage_tools() {
 # Stage registry -- add new stages here
 # ============================================================
 
-STAGE_IDS=(display-fix zsh motd tools)
+STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools)
 
 declare -A STAGE_DESCRIPTIONS=(
   [display-fix]="Force 1920x1080@60 on DP-1 (greeter service + XFCE profile)"
+  [xfce-shortcuts]="Remap tile-window shortcuts from Super+keypad-arrow to Super+arrow"
   [zsh]="Install zsh + plugins, set as login shell, deploy .zshrc"
   [motd]="Install the NIVROKU /etc/motd banner"
-  [tools]="apt update/full-upgrade, install fastfetch + sysbench"
+  [tools]="apt update/full-upgrade, install fastfetch, sysbench, btop, flashrom"
 )
 
 declare -A STAGE_FUNCS=(
   [display-fix]=stage_display_fix
+  [xfce-shortcuts]=stage_xfce_shortcuts
   [zsh]=stage_zsh
   [motd]=stage_motd
   [tools]=stage_tools
