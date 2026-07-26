@@ -24,7 +24,8 @@
 #                       highlighting, make it the login shell, deploy .zshrc.
 #   4. motd             Install the NIVROKU /etc/motd banner.
 #   5. tools            apt update && full-upgrade, install fastfetch,
-#                       sysbench, btop, and flashrom.            [--apps]
+#                       sysbench, btop, flashrom, and Ookla Speedtest CLI.
+#                                                                 [--apps]
 #
 # REQUIREMENTS
 #   * Run as your normal desktop user -- NOT as root, NOT via sudo.
@@ -583,7 +584,7 @@ stage_tools() {
   sudo apt full-upgrade -y 2>&1 | tee -a "$LOG_DIR/updates.log"
   APT_UPDATED=1
 
-  log "Ensuring sysbench, btop, flashrom, and fastfetch are installed"
+  log "Ensuring sysbench, btop, flashrom, fastfetch, and speedtest are installed"
 
   local pkg
   for pkg in sysbench btop flashrom; do
@@ -599,6 +600,28 @@ stage_tools() {
     sudo apt -f install -y 2>&1 | tee -a "$LOG_DIR/updates.log"
     rm -f "$LOG_DIR/fastfetch.deb"
   fi
+
+  # Ookla's own repo, not a Debian-packaged tool -- installed via their
+  # official packagecloud script. Two independent things to check before
+  # doing anything, so re-runs (and --apps on its own) stay cheap:
+  #   1. is the package already installed
+  #   2. is the repo already registered (so we don't re-fetch+re-run a
+  #      root shell script off the network for no reason)
+  if command -v speedtest >/dev/null 2>&1; then
+    log "Ookla Speedtest CLI already installed, skipping"
+  else
+    local ookla_repo_list="/etc/apt/sources.list.d/ookla_speedtest-cli.list"
+    if [[ -f "$ookla_repo_list" ]]; then
+      log "Ookla repository already registered, skipping repo-install script"
+    else
+      log "Adding the Ookla Speedtest repository"
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash
+    fi
+    log "Installing speedtest"
+    sudo apt-get install -y speedtest 2>&1 | tee -a "$LOG_DIR/updates.log"
+  fi
+
+  hint "First real run needs license acceptance: speedtest --accept-license --accept-gdpr"
 }
 
 # ============================================================
@@ -612,7 +635,7 @@ declare -A STAGE_DESCRIPTIONS=(
   [xfce-shortcuts]="Remap tile-window shortcuts from Super+keypad-arrow to Super+arrow"
   [zsh]="Install zsh + plugins, set as login shell, deploy .zshrc"
   [motd]="Install the NIVROKU /etc/motd banner"
-  [tools]="apt update/full-upgrade, install fastfetch, sysbench, btop, flashrom"
+  [tools]="apt update/full-upgrade, install fastfetch, sysbench, btop, flashrom, speedtest"
 )
 
 declare -A STAGE_FUNCS=(
