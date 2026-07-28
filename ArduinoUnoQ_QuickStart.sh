@@ -23,9 +23,10 @@
 #   3. zsh              Install zsh + zsh-autosuggestions + zsh-syntax-
 #                       highlighting, make it the login shell, deploy .zshrc.
 #   4. motd             Install the NIVROKU /etc/motd banner.
-#   5. tools            apt update && full-upgrade, install fastfetch,
-#                       sysbench, btop, flashrom, and Ookla Speedtest CLI.
-#                                                                 [--apps]
+#   5. tools            apt update && full-upgrade (kernel included --
+#                       this board only tracks Arduino-provided repos),
+#                       install fastfetch, sysbench, btop, flashrom, and
+#                       Ookla Speedtest CLI.                     [--apps]
 #
 # REQUIREMENTS
 #   * Run as your normal desktop user -- NOT as root, NOT via sudo.
@@ -431,7 +432,22 @@ stage_xfce_shortcuts() {
 stage_zsh() {
   local zsh_packages=(zsh zsh-common zsh-autosuggestions zsh-syntax-highlighting)
 
-  if dpkg -s "${zsh_packages[@]}" >/dev/null 2>&1; then
+  # NOTE: this used to be `dpkg -s "${zsh_packages[@]}"`, gating on its exit
+  # code alone. That's a real bug -- dpkg -s exits 0 for a package it merely
+  # has *a record of*, including half-configured/unpacked-but-not-configured
+  # states, not only "install ok installed". A board that was rebooting
+  # mid-upgrade (as this one was) can easily leave a package in exactly that
+  # state, and the old check would have called it "already installed" and
+  # skipped apt install -- silently leaving it broken instead of letting apt
+  # finish configuring it. Checking the actual Status field is the fix.
+  local zsh_all_installed=1
+  local pkg status
+  for pkg in "${zsh_packages[@]}"; do
+    status="$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true)"
+    [[ "$status" == "install ok installed" ]] || { zsh_all_installed=0; break; }
+  done
+
+  if [[ "$zsh_all_installed" -eq 1 ]]; then
     log "zsh and plugins already installed, skipping apt install"
   else
     ensure_apt_index_fresh
@@ -485,7 +501,7 @@ HISTFILE=~/.zsh_history
 
 # Use modern completion system
 autoload -Uz compinit
-compinit
+compinit -u
 
 zstyle ':completion:*' auto-description 'specify: %d'
 zstyle ':completion:*' completer _expand _complete _correct _approximate
@@ -579,8 +595,53 @@ stage_tools() {
   : > "$LOG_DIR/updates.log"
   log "apt/install output also being teed to $LOG_DIR/updates.log"
 
+  # Finish configuring anything dpkg left half-done. A board that's been
+  # rebooting mid-upgrade (as this one was) can easily have a package
+  # stuck "unpacked but not configured" from an interrupted dpkg run --
+  # this repairs that before anything else touches the package database.
+  # Safe and fast when there's nothing pending.
+  log "Repairing any half-configured packages (dpkg --configure -a)"
+  sudo dpkg --configure -a 2>&1 | tee -a "$LOG_DIR/updates.log"
+
+  # Kernel packages are NOT held here -- this lab only tracks
+  # Arduino-provided repos, so a kernel bump is an Arduino release, not
+  # an untested swap from a generic Debian mirror. If an earlier run of
+  # this script left any kernel package held, release it so full-upgrade
+  # actually updates it like everything else.
+  local kernel_pkgs
+  kernel_pkgs="$(dpkg-query -W -f='${Package}\n' 'linux-image*' 'linux-headers*' 'linux-modules*' 2>/dev/null || true)"
+  if [[ -n "$kernel_pkgs" ]]; then
+    local already_held pkg held_now=()
+    already_held="$(apt-mark showhold 2>/dev/null || true)"
+    while IFS= read -r pkg; do
+      [[ -z "$pkg" ]] && continue
+      grep -qxF "$pkg" <<< "$already_held" && held_now+=("$pkg")
+    done <<< "$kernel_pkgs"
+
+    if (( ${#held_now[@]} )); then
+      log "Releasing kernel package hold(s) left by an earlier run: ${held_now[*]}"
+      sudo apt-mark unhold "${held_now[@]}" >/dev/null
+    fi
+  fi
+
   log "apt update & full-upgrade"
   sudo apt update 2>&1 | tee -a "$LOG_DIR/updates.log"
+
+  # Not a block, just a heads-up: print it plainly if this upgrade
+  # includes a kernel version change, so it's the first thing you think
+  # of if display/hardware behavior looks different afterward.
+  if [[ -n "$kernel_pkgs" ]]; then
+    local pkg cur cand
+    while IFS= read -r pkg; do
+      [[ -z "$pkg" ]] && continue
+      cur="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+      cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}')"
+      if [[ -n "$cur" && -n "$cand" && "$cur" != "$cand" ]]; then
+        warn "This upgrade includes a kernel change: $pkg $cur -> $cand"
+      fi
+    done <<< "$kernel_pkgs"
+  fi
+
   sudo apt full-upgrade -y 2>&1 | tee -a "$LOG_DIR/updates.log"
   APT_UPDATED=1
 
@@ -635,7 +696,7 @@ declare -A STAGE_DESCRIPTIONS=(
   [xfce-shortcuts]="Remap tile-window shortcuts from Super+keypad-arrow to Super+arrow"
   [zsh]="Install zsh + plugins, set as login shell, deploy .zshrc"
   [motd]="Install the NIVROKU /etc/motd banner"
-  [tools]="apt update/full-upgrade, install fastfetch, sysbench, btop, flashrom, speedtest"
+  [tools]="apt update/full-upgrade (kernel included), install fastfetch, sysbench, btop, flashrom, speedtest"
 )
 
 declare -A STAGE_FUNCS=(
