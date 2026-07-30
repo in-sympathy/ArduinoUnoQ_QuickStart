@@ -708,6 +708,21 @@ stage_sudo() {
   local target_user
   target_user="$(id -un)"
 
+  # visudo lives in /usr/sbin, which a non-root user's PATH commonly does
+  # NOT include (that's the whole reason this script insists on running
+  # as a normal user rather than root) -- `command -v visudo` fails there
+  # even though the binary is sitting right there. Check the well-known
+  # locations directly instead of trusting PATH for this one.
+  local visudo_bin="" candidate
+  for candidate in /usr/sbin/visudo /sbin/visudo /usr/local/sbin/visudo; do
+    if [[ -x "$candidate" ]]; then
+      visudo_bin="$candidate"
+      break
+    fi
+  done
+  [[ -n "$visudo_bin" ]] || visudo_bin="$(command -v visudo || true)"
+  [[ -n "$visudo_bin" ]] || die "visudo not found (checked /usr/sbin, /sbin, /usr/local/sbin, and \$PATH) -- it ships with the sudo package, which must already be installed for this script to have gotten this far. Refusing to install an unvalidated sudoers file."
+
   local sudoers_file="/etc/sudoers.d/${target_user}-nopasswd"
   local tmp_sudoers
   tmp_sudoers="$(mktemp)"
@@ -718,10 +733,8 @@ $target_user ALL=(ALL) NOPASSWD: ALL
 SUDOERS_CONTENT
   chmod 0440 "$tmp_sudoers"
 
-  command -v visudo >/dev/null 2>&1 || die "visudo not found -- it ships with the sudo package, which must already be installed for this script to have gotten this far. Refusing to install an unvalidated sudoers file."
-
   local check_output
-  if ! check_output="$(visudo -c -f "$tmp_sudoers" 2>&1)"; then
+  if ! check_output="$("$visudo_bin" -c -f "$tmp_sudoers" 2>&1)"; then
     rm -f "$tmp_sudoers"
     die "Generated sudoers content failed validation, refusing to install it: $check_output"
   fi
