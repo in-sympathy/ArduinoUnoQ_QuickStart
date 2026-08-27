@@ -552,7 +552,6 @@ stage_motd() {
   local tmp_motd
   tmp_motd="$(mktemp)"
   cat > "$tmp_motd" <<'MOTD_CONTENT'
-  
 ███╗   ██╗██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗██╗   ██╗
 ████╗  ██║██║██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██║   ██║
 ██╔██╗ ██║██║██║   ██║██████╔╝██║   ██║█████╔╝ ██║   ██║
@@ -561,9 +560,8 @@ stage_motd() {
 ╚═╝  ╚═══╝╚═╝  ╚═══╝  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
 
                   NIVROKU.COM.UA
-
-         Electronics Repair Lab         
-    Microsoldering • Firmware • Data Recovery    
+              Electronics Repair Lab
+    Microsoldering • Firmware • Data Recovery
 
 
                     .~~.   .~~.
@@ -576,7 +574,6 @@ stage_motd() {
                    (  : '~' :  )
                     '~ .~~~. ~'
                         '~'
-
 MOTD_CONTENT
 
   if write_if_changed "$motd_file" "$tmp_motd" sudo; then
