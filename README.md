@@ -1,4 +1,4 @@
-# deploy-uno-q.sh
+# ArduinoUnoQ_QuickStart.sh
 
 Post-flash provisioning script for Arduino UNO Q boards. Run it once after
 flashing (or reflashing) a board and it brings the board up to a standard,
@@ -41,14 +41,14 @@ already-provisioned board is always safe and fast.
 ```bash
 git clone <this-repo-url>
 cd <this-repo>
-chmod +x deploy-uno-q.sh
-./deploy-uno-q.sh
+chmod +x ArduinoUnoQ_QuickStart.sh
+./ArduinoUnoQ_QuickStart.sh
 ```
 
 That runs every stage, in order. To see what it's about to do first:
 
 ```bash
-./deploy-uno-q.sh --list
+./ArduinoUnoQ_QuickStart.sh --list
 ```
 
 ## Stages
@@ -68,7 +68,7 @@ Stages run in this order by default. Skip or select individual ones with
 ## Options
 
 ```
-Usage: deploy-uno-q.sh [OPTIONS]
+Usage: ArduinoUnoQ_QuickStart.sh [OPTIONS]
 
   -l, --list            List available stages and exit
   -o, --only LIST       Run only these stages, comma-separated ids
@@ -85,12 +85,12 @@ Usage: deploy-uno-q.sh [OPTIONS]
 ## Examples
 
 ```bash
-./deploy-uno-q.sh                     # everything, in order
-./deploy-uno-q.sh --list              # see what's available
-./deploy-uno-q.sh --only zsh          # just one stage
-./deploy-uno-q.sh --skip motd,tools   # everything except these
-./deploy-uno-q.sh --screen --apps     # combine flags to run several stages
-./deploy-uno-q.sh --only sudo         # one-time: passwordless sudo setup
+./ArduinoUnoQ_QuickStart.sh                     # everything, in order
+./ArduinoUnoQ_QuickStart.sh --list              # see what's available
+./ArduinoUnoQ_QuickStart.sh --only zsh          # just one stage
+./ArduinoUnoQ_QuickStart.sh --skip motd,tools   # everything except these
+./ArduinoUnoQ_QuickStart.sh --screen --apps     # combine flags to run several stages
+./ArduinoUnoQ_QuickStart.sh --only sudo         # one-time: passwordless sudo setup
 ```
 
 ## Why some of this exists
