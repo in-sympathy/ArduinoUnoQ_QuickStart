@@ -491,6 +491,15 @@ autoload -Uz promptinit
 promptinit
 prompt adam1
 
+# adam1's built-in hostname field is %m (short hostname, up to the first
+# '.'), not %M (full hostname). It sets $base_prompt once at setup time
+# and its precmd hook re-reads that same variable on every prompt draw,
+# so mutating it here -- after the theme is loaded -- is enough; no need
+# to touch the hook or the theme file itself. The backslash before %m is
+# required: zsh's pattern matcher treats a bare % as special and it
+# silently fails to match without it.
+base_prompt="${base_prompt//\%m/%M}"
+
 setopt histignorealldups sharehistory
 
 # Use emacs keybindings even if our EDITOR is set to vi
@@ -552,6 +561,7 @@ stage_motd() {
   local tmp_motd
   tmp_motd="$(mktemp)"
   cat > "$tmp_motd" <<'MOTD_CONTENT'
+
 
 ███╗   ██╗██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗██╗   ██╗
 ████╗  ██║██║██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██║   ██║
