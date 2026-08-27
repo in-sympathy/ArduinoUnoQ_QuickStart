@@ -563,19 +563,7 @@ stage_motd() {
                   NIVROKU.COM.UA
               Electronics Repair Lab
     Microsoldering • Firmware • Data Recovery
-
-
-                    .~~.   .~~.
-                   '. \ ' ' / .'
-                    .~ .~~~..~.
-                   : .~.'~'.~. :
-                  ~ (   ) (   ) ~
-                 ( : '~'.~.'~' : )
-                  ~ .~ (   ) ~. ~
-                   (  : '~' :  )
-                    '~ .~~~. ~'
-                        '~'
-
+    
 MOTD_CONTENT
 
   if write_if_changed "$motd_file" "$tmp_motd" sudo; then
