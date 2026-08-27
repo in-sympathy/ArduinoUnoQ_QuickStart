@@ -561,8 +561,8 @@ stage_motd() {
 
                   NIVROKU.COM.UA
 
-           Raspberry Pi / SBC Repair Lab
-   BGA • BIOS • EC • eMMC • PMIC • Microsoldering
+         Electronics Repair Lab         
+    Microsoldering • Firmware • Data Recovery    
 
 
                     .~~.   .~~.
