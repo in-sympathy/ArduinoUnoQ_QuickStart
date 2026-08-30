@@ -570,7 +570,7 @@ stage_motd() {
 ██║ ╚████║██║ ╚████╔╝ ██║  ██║╚██████╔╝██║  ██╗╚██████╔╝
 ╚═╝  ╚═══╝╚═╝  ╚═══╝  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
 
-                     NIVROKU.COM.UA
+                       NIVROKU.COM.UA    
                    Electronics Repair Lab
          Microsoldering • Firmware • Data Recovery
 
