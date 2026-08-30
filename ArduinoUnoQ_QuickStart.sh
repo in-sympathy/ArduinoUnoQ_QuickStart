@@ -562,7 +562,6 @@ stage_motd() {
   tmp_motd="$(mktemp)"
   cat > "$tmp_motd" <<'MOTD_CONTENT'
 
-
 ███╗   ██╗██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗██╗   ██╗
 ████╗  ██║██║██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██║   ██║
 ██╔██╗ ██║██║██║   ██║██████╔╝██║   ██║█████╔╝ ██║   ██║
@@ -570,9 +569,9 @@ stage_motd() {
 ██║ ╚████║██║ ╚████╔╝ ██║  ██║╚██████╔╝██║  ██╗╚██████╔╝
 ╚═╝  ╚═══╝╚═╝  ╚═══╝  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
 
-                       NIVROKU.COM.UA    
-                   Electronics Repair Lab
-         Microsoldering • Firmware • Data Recovery
+                     NIVROKU.COM.UA
+                 Electronics Repair Lab
+       Microsoldering • Firmware • Data Recovery
 
 MOTD_CONTENT
 
