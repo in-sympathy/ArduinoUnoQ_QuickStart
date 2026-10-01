@@ -29,6 +29,9 @@
 #                       Ookla Speedtest CLI.                     [--apps]
 #   6. sudo             Passwordless sudo for the invoking user, via a
 #                       validated /etc/sudoers.d/ drop-in.
+#   7. github-ssh       Generate (or reuse) an ed25519 key for GitHub
+#                       access, print the public key with setup steps.
+#                       Never touches GitHub itself.      [--github-ssh]
 #
 # REQUIREMENTS
 #   * Run as your normal desktop user -- NOT as root, NOT via sudo.
@@ -562,6 +565,7 @@ stage_motd() {
   tmp_motd="$(mktemp)"
   cat > "$tmp_motd" <<'MOTD_CONTENT'
 
+
 ███╗   ██╗██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗██╗   ██╗
 ████╗  ██║██║██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██║   ██║
 ██╔██╗ ██║██║██║   ██║██████╔╝██║   ██║█████╔╝ ██║   ██║
@@ -750,10 +754,100 @@ SUDOERS_CONTENT
 }
 
 # ============================================================
+# Stage: github-ssh
+# ============================================================
+#
+# Generates (or reuses) an SSH key for this board to authenticate to
+# GitHub, and prints the public key plus the steps to register it.
+# Doesn't touch GitHub itself -- adding the key to the account at
+# https://github.com/settings/ssh/new is a manual step every time, on
+# every board, so this stage is idempotent on the *key material* (skip
+# generation if a key already exists) but always re-prints the public
+# key and instructions, since re-running it just to get the key back on
+# screen is a legitimate use on its own.
+#
+# ed25519, no passphrase: consistent with this lab's passwordless-sudo
+# posture elsewhere in this script -- a single-technician, physically
+# controlled devboard, where a passphrase prompt on every git fetch is
+# friction without a matching benefit. If you reuse this on a different
+# kind of deployment, reconsider this (and the sudo stage) specifically.
+
+stage_github_ssh() {
+  local ssh_dir="$HOME/.ssh"
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+
+  # Prefer an existing key over generating a second one, checked in this
+  # order. (id_dsa is deliberately not checked -- GitHub stopped
+  # accepting DSA keys years ago, so finding one isn't a reason to skip
+  # generating a key that will actually work.)
+  local key_types=(ed25519 ecdsa rsa)
+  local key_type priv_key="" pub_key=""
+  for key_type in "${key_types[@]}"; do
+    if [[ -f "$ssh_dir/id_$key_type" ]]; then
+      priv_key="$ssh_dir/id_$key_type"
+      pub_key="$priv_key.pub"
+      break
+    fi
+  done
+
+  if [[ -n "$priv_key" ]]; then
+    log "Existing SSH key found ($(basename "$priv_key")), skipping generation"
+    if [[ ! -f "$pub_key" ]]; then
+      warn "$pub_key is missing even though $priv_key exists -- regenerating the public half from it"
+      ssh-keygen -y -f "$priv_key" > "$pub_key"
+    fi
+  else
+    priv_key="$ssh_dir/id_ed25519"
+    pub_key="$priv_key.pub"
+    local comment
+    comment="$(id -un)@$(hostname)-uno-q"
+    log "No existing SSH key found, generating a new ed25519 key"
+    ssh-keygen -t ed25519 -f "$priv_key" -N "" -C "$comment" -q
+  fi
+  chmod 600 "$priv_key"
+  chmod 644 "$pub_key"
+
+  # Non-interactive-friendly default for future git/ssh calls to GitHub:
+  # accept the host key on first contact instead of prompting (and
+  # hanging, if nothing's there to answer it). Only touches ~/.ssh/config
+  # when this exact block isn't already present -- anything else in that
+  # file, including a github.com entry you wrote by hand, is left alone.
+  # (If you do have your own github.com block already, ssh_config takes
+  # the first value it finds for each setting, so appending ours after
+  # yours is safe either way: yours wins on anything it sets, ours just
+  # fills in StrictHostKeyChecking if yours didn't.)
+  local config_file="$ssh_dir/config"
+  local marker_begin="# >>> deploy-uno-q.sh managed block: github.com >>>"
+  local marker_end="# <<< deploy-uno-q.sh managed block: github.com <<<"
+
+  if [[ -f "$config_file" ]] && grep -qF "$marker_begin" "$config_file"; then
+    log "$config_file already has a github.com block, skipping"
+  else
+    log "Adding a github.com entry to $config_file (StrictHostKeyChecking accept-new)"
+    touch "$config_file"
+    chmod 600 "$config_file"
+    {
+      [[ -s "$config_file" ]] && echo
+      echo "$marker_begin"
+      echo "Host github.com"
+      echo "    StrictHostKeyChecking accept-new"
+      echo "$marker_end"
+    } >> "$config_file"
+  fi
+
+  log "Public key ($(basename "$pub_key")):"
+  hint "$(cat "$pub_key")"
+  hint "Add it at:  https://github.com/settings/ssh/new"
+  hint "Then test:  ssh -T git@github.com"
+  hint "Git remotes need the SSH form for this key to be used: git@github.com:user/repo.git (not https://github.com/...)"
+}
+
+# ============================================================
 # Stage registry -- add new stages here
 # ============================================================
 
-STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools sudo)
+STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools sudo github-ssh)
 
 declare -A STAGE_DESCRIPTIONS=(
   [display-fix]="Force 1920x1080@60 on DP-1 (greeter service + XFCE profile)"
@@ -762,6 +856,7 @@ declare -A STAGE_DESCRIPTIONS=(
   [motd]="Install the NIVROKU /etc/motd banner"
   [tools]="apt update/full-upgrade (kernel included), install fastfetch, sysbench, btop, flashrom, speedtest"
   [sudo]="Passwordless sudo for the invoking user (validated sudoers.d drop-in)"
+  [github-ssh]="Generate/reuse an ed25519 key for GitHub, print it with setup steps"
 )
 
 declare -A STAGE_FUNCS=(
@@ -771,6 +866,7 @@ declare -A STAGE_FUNCS=(
   [motd]=stage_motd
   [tools]=stage_tools
   [sudo]=stage_sudo
+  [github-ssh]=stage_github_ssh
 )
 
 # ============================================================
@@ -794,16 +890,19 @@ Options:
       --screen          Run just the display-fix stage
       --keyboard        Run just the xfce-shortcuts stage
       --apps            Run just the tools (package installation) stage
+      --github-ssh      Run just the github-ssh stage
   -h, --help            Show this help and exit
 
-  --screen, --keyboard, and --apps can be combined with each other (and
-  with --only/--skip) to run more than one stage in a single pass.
+  --screen, --keyboard, --apps, and --github-ssh can be combined with
+  each other (and with --only/--skip) to run more than one stage in a
+  single pass.
 
 Examples:
   ./$SCRIPT_NAME                     Run every stage, in order
   ./$SCRIPT_NAME --only display-fix  Run just the display fix
   ./$SCRIPT_NAME --skip motd,tools   Run everything except motd + tools
   ./$SCRIPT_NAME --screen --apps     Run the display fix and tools stages
+  ./$SCRIPT_NAME --github-ssh        Generate/print this board's GitHub key
 USAGE
 }
 
@@ -842,6 +941,10 @@ parse_args() {
         ;;
       --apps)
         ONLY_STAGES+=(tools)
+        shift
+        ;;
+      --github-ssh)
+        ONLY_STAGES+=(github-ssh)
         shift
         ;;
       -h|--help)
