@@ -1,4 +1,4 @@
-# ArduinoUnoQ_QuickStart.sh
+# deploy-uno-q.sh
 
 Post-flash provisioning script for Arduino UNO Q boards. Run it once after
 flashing (or reflashing) a board and it brings the board up to a standard,
@@ -41,14 +41,14 @@ already-provisioned board is always safe and fast.
 ```bash
 git clone <this-repo-url>
 cd <this-repo>
-chmod +x ArduinoUnoQ_QuickStart.sh
-./ArduinoUnoQ_QuickStart.sh
+chmod +x deploy-uno-q.sh
+./deploy-uno-q.sh
 ```
 
 That runs every stage, in order. To see what it's about to do first:
 
 ```bash
-./ArduinoUnoQ_QuickStart.sh --list
+./deploy-uno-q.sh --list
 ```
 
 ## Stages
@@ -64,11 +64,12 @@ Stages run in this order by default. Skip or select individual ones with
 | 4 | `motd` | — | Installs the lab's `/etc/motd` banner. |
 | 5 | `tools` | `--apps` | `apt update && full-upgrade` (kernel included — this board only tracks Arduino-provided repos, so a kernel bump here is an Arduino release, not an untested swap from a generic mirror), plus `fastfetch`, `sysbench`, `btop`, `flashrom`, and the Ookla Speedtest CLI. |
 | 6 | `sudo` | — | Passwordless `sudo` for the invoking user, via a `/etc/sudoers.d/` drop-in that's syntax-validated with `visudo -c` *before* it's ever installed. |
+| 7 | `github-ssh` | `--github-ssh` | Generates (or reuses) an `ed25519` SSH key for this board and prints the public key with the steps to add it to GitHub. Never touches GitHub itself — registering the key is always a manual step. Safe to re-run any time just to get the public key back on screen. |
 
 ## Options
 
 ```
-Usage: ArduinoUnoQ_QuickStart.sh [OPTIONS]
+Usage: deploy-uno-q.sh [OPTIONS]
 
   -l, --list            List available stages and exit
   -o, --only LIST       Run only these stages, comma-separated ids
@@ -76,21 +77,24 @@ Usage: ArduinoUnoQ_QuickStart.sh [OPTIONS]
       --screen          Run just the display-fix stage
       --keyboard        Run just the xfce-shortcuts stage
       --apps            Run just the tools (package installation) stage
+      --github-ssh      Run just the github-ssh stage
   -h, --help            Show this help and exit
 ```
 
-`--screen`, `--keyboard`, and `--apps` can be combined with each other
-(and with `--only`/`--skip`) to run more than one stage in a single pass.
+`--screen`, `--keyboard`, `--apps`, and `--github-ssh` can be combined
+with each other (and with `--only`/`--skip`) to run more than one stage
+in a single pass.
 
 ## Examples
 
 ```bash
-./ArduinoUnoQ_QuickStart.sh                     # everything, in order
-./ArduinoUnoQ_QuickStart.sh --list              # see what's available
-./ArduinoUnoQ_QuickStart.sh --only zsh          # just one stage
-./ArduinoUnoQ_QuickStart.sh --skip motd,tools   # everything except these
-./ArduinoUnoQ_QuickStart.sh --screen --apps     # combine flags to run several stages
-./ArduinoUnoQ_QuickStart.sh --only sudo         # one-time: passwordless sudo setup
+./deploy-uno-q.sh                     # everything, in order
+./deploy-uno-q.sh --list              # see what's available
+./deploy-uno-q.sh --only zsh          # just one stage
+./deploy-uno-q.sh --skip motd,tools   # everything except these
+./deploy-uno-q.sh --screen --apps     # combine flags to run several stages
+./deploy-uno-q.sh --only sudo         # one-time: passwordless sudo setup
+./deploy-uno-q.sh --github-ssh        # generate/print this board's GitHub key
 ```
 
 ## Why some of this exists
@@ -117,6 +121,12 @@ A couple of decisions here aren't obvious from the flag names alone:
   currently bound to the keypad-arrow shortcuts and moves it, rather
   than asserting fixed values — safer than transcribing bindings by hand
   and correct even if a future image ships slightly different defaults.
+- **`github-ssh` generates a passphrase-free key, on purpose.** Same
+  reasoning as the `sudo` stage: a single-technician, physically
+  controlled board, where a passphrase prompt on every `git fetch`
+  is friction without a matching benefit. Only the public key is ever
+  printed or logged — the private key is never displayed or sent
+  anywhere by this script.
 
 ## Extending it
 
@@ -147,4 +157,10 @@ whole script a no-op when nothing's different.
   profile. Run over SSH and it'll install the greeter-level fix fine but
   warn about skipping the rest — re-run `--only display-fix` from the
   actual desktop afterward.
+- `github-ssh` doesn't add the key to GitHub for you — copy the printed
+  public key to <https://github.com/settings/ssh/new> yourself, then
+  verify with `ssh -T git@github.com`. It also adds a small managed
+  block to `~/.ssh/config` (`StrictHostKeyChecking accept-new` for
+  `github.com`) so that first connection doesn't hang on a host-key
+  prompt; anything else already in that file is left untouched.
 - Full log of each run: `~/.uno-q-deploy/logs/`.
