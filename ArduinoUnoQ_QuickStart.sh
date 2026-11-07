@@ -7,46 +7,49 @@
 # firmware/image update: run this once per fresh flash and it brings the
 # board up to the standard lab image. Every stage checks its own work
 # first and skips anything already applied, so re-running the script (in
-# full or with --only/--skip/--screen/--keyboard/--apps/--ha/--part) is
-# always safe.
+# full or with --only/--skip/--screen/--keyboard/--apps/--wg/--ha/--part)
+# is always safe.
 #
 # Stages (run in this order by default):
-#   1. display-fix     Force 1920x1080@60 on DP-1 at the greeter AND inside
+#   1. code-dir         Create ~/Code, owned by you: the working folder for
+#                       git clones and for board files other stages read
+#                       (the wireguard stage reads ~/Code/UnoQ.conf).
+#   2. display-fix     Force 1920x1080@60 on DP-1 at the greeter AND inside
 #                       the XFCE desktop session (two independent EDID
 #                       workarounds -- see stage_display_fix() for why both
 #                       are needed).                          [--screen]
-#   2. xfce-shortcuts   Remap the window-tiling keyboard shortcuts from
+#   3. xfce-shortcuts   Remap the window-tiling keyboard shortcuts from
 #                       Super+<keypad arrow> to Super+<arrow>, whatever
 #                       command is currently bound to each -- see
 #                       stage_xfce_shortcuts() for why this is done as a
 #                       live discover-and-migrate rather than hardcoded.
 #                                                             [--keyboard]
-#   3. zsh              Install zsh + zsh-autosuggestions + zsh-syntax-
+#   4. zsh              Install zsh + zsh-autosuggestions + zsh-syntax-
 #                       highlighting, make it the login shell, deploy .zshrc.
-#   4. motd             Install the NIVROKU /etc/motd banner.
-#   5. tools            apt update && full-upgrade (kernel included --
+#   5. motd             Install the NIVROKU /etc/motd banner.
+#   6. tools            apt update && full-upgrade (kernel included --
 #                       the kernel this board boots is Arduino's build),
 #                       install fastfetch, sysbench, btop, flashrom, and
 #                       Ookla Speedtest CLI.                     [--apps]
-#   6. sudo             Passwordless sudo for the invoking user, via a
+#   7. sudo             Passwordless sudo for the invoking user, via a
 #                       validated /etc/sudoers.d/ drop-in.
-#   7. github-ssh       Generate (or reuse) an ed25519 key for GitHub
+#   8. github-ssh       Generate (or reuse) an ed25519 key for GitHub
 #                       access, print the public key with setup steps.
 #                       Never touches GitHub itself.      [--github-ssh]
 #
 # Opt-in stages (NEVER part of a default run -- they only run when
 # selected by their flag or by --only):
-#   8. wireguard        Always-on WireGuard client to the lab's PiVPN
+#   9. wireguard        Always-on WireGuard client to the lab's PiVPN
 #                       server, built from the client config PiVPN
-#                       generated for this board (~/wg-client.conf):
+#                       generated for this board (~/Code/UnoQ.conf):
 #                       userspace wireguard-go, split tunnel, keepalive,
 #                       Pi-hole as DNS with the LAN gateway as fallback.
 #                                                                 [--wg]
-#   9. home-assistant   Home Assistant Container + the matter.js Matter
+#  10. home-assistant   Home Assistant Container + the matter.js Matter
 #                       server as one docker compose project in
 #                       ~/homeassistant, Matter API on loopback only.
 #                                                                 [--ha]
-#  10. merge-partitions Fold the separate userdata (/home/arduino)
+#  11. merge-partitions Fold the separate userdata (/home/arduino)
 #                       partition into rootfs, so the whole eMMC is one
 #                       root filesystem. Destructive, spans two reboots:
 #                       each run detects where the board is and does the
@@ -66,7 +69,7 @@
 #     desktop and run fine over SSH. merge-partitions does need an
 #     interactive terminal: it asks for a typed "yes" before deleting the
 #     userdata partition. wireguard needs this board's PiVPN client
-#     config at ~/wg-client.conf (or WG_CLIENT_CONF=/path/to/file).
+#     config at ~/Code/UnoQ.conf (or WG_CLIENT_CONF=/path/to/file).
 #
 # USAGE
 #   chmod +x deploy-uno-q.sh
@@ -113,6 +116,9 @@ readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_DIR="${LOG_DIR:-$HOME/.uno-q-deploy/logs}"
 mkdir -p "$LOG_DIR"
 readonly RUN_LOG="$LOG_DIR/deploy-$(date +%Y%m%d-%H%M%S).log"
+
+# The working folder for git clones and board files (see stage_code_dir).
+readonly CODE_DIR="$HOME/Code"
 
 CURRENT_STAGE=""
 APT_UPDATED=0
@@ -250,6 +256,46 @@ preflight_checks() {
   log "Requesting sudo access (you may be prompted for your password)"
   sudo -v || die "Could not obtain sudo privileges."
   start_sudo_keepalive
+}
+
+# ============================================================
+# Stage: code-dir
+# ============================================================
+#
+# ~/Code is the working folder on every lab board: git clones go there,
+# and so do board-specific files other stages read -- the wireguard stage
+# takes this board's PiVPN client config from ~/Code/UnoQ.conf. It has
+# to belong to you, not root, so git and editors work in it without sudo.
+# If it already exists but belongs to someone else (e.g. a sudo command
+# created it), only the folder itself is handed back to you; what's
+# inside is left as it is.
+
+ensure_code_dir() {
+  local me owner
+  me="$(id -un):$(id -gn)"
+  if [[ -e $CODE_DIR && ! -d $CODE_DIR ]]; then
+    die "$CODE_DIR exists but isn't a folder -- move it aside and re-run."
+  fi
+  if [[ ! -d $CODE_DIR ]]; then
+    mkdir -p "$CODE_DIR"
+    log "Created $CODE_DIR"
+    return 0
+  fi
+  owner="$(stat -c '%U:%G' "$CODE_DIR")"
+  if [[ $owner != "$me" ]]; then
+    sudo chown "$me" "$CODE_DIR"
+    log "Gave $CODE_DIR back to $me (it belonged to $owner); its contents were left as they are"
+  else
+    log "$CODE_DIR already exists and belongs to $me"
+  fi
+}
+
+stage_code_dir() {
+  ensure_code_dir
+  if [[ ! -e $CODE_DIR/UnoQ.conf ]]; then
+    hint "For --wg, put this board's PiVPN client config here:"
+    hint "  install -m 600 /dev/null $CODE_DIR/UnoQ.conf && nano $CODE_DIR/UnoQ.conf"
+  fi
 }
 
 # ============================================================
@@ -896,8 +942,11 @@ stage_github_ssh() {
 # client and makes Pi-hole, reached through the tunnel, the board's
 # first DNS server. The input is the client config PiVPN generates for
 # this board: create the peer on the server (`pivpn add -n <name>`),
-# copy ~/configs/<name>.conf from there to ~/wg-client.conf here (or set
-# WG_CLIENT_CONF=/path/to/file). Keys never live in this script.
+# and put ~/configs/<name>.conf from there at ~/Code/UnoQ.conf here (or
+# anywhere, with WG_CLIENT_CONF=/path/to/file). Keys never live in this
+# script. The file stays where you put it -- re-runs read it -- so the
+# stage keeps it at mode 600 and warns if it sits in a git repository
+# without being ignored, since it holds this board's private key.
 #
 # Decisions baked in:
 #
@@ -928,7 +977,7 @@ stage_github_ssh() {
 #     goes first on the LAN connection and the LAN's gateway second, so
 #     a tunnel or server outage makes lookups slower instead of failing
 #     them. The value is kept as a comment in the generated wg0.conf, so
-#     a re-run still knows it after you delete ~/wg-client.conf.
+#     a re-run still knows it if the client config is gone.
 #   * wg-quick@<iface> gets Restart=on-failure, so a failed start at
 #     boot is retried instead of leaving the tunnel down.
 
@@ -1044,9 +1093,31 @@ wg_apply_dns() {
   fi
 }
 
+# wg_check_src_private <client_conf>
+# The client config holds this board's private key: keep it mode 600,
+# and warn if it sits in a git repository without being ignored.
+wg_check_src_private() {
+  local src="$1" dir mode
+  [[ -r $src ]] || die "Can't read $src -- check its owner: ls -l $src"
+  mode="$(stat -c %a "$src")"
+  if [[ $mode != 600 && $mode != 400 ]]; then
+    chmod 600 "$src" 2>/dev/null || sudo chmod 600 "$src"
+    log "Tightened $src to mode 600 (was $mode) -- it holds this board's private key"
+  fi
+
+  command -v git >/dev/null 2>&1 || return 0
+  dir="$(dirname "$src")"
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  if git -C "$dir" ls-files --error-unmatch "$src" >/dev/null 2>&1; then
+    warn "$src is committed to the git repository in $dir. It holds this board's private key: take it out of the repo (git rm --cached), and if that commit was ever pushed, replace the key on the server (pivpn remove, then pivpn add)."
+  elif ! git -C "$dir" check-ignore -q "$src"; then
+    warn "$src is inside a git repository and isn't ignored. It holds this board's private key -- add it to .gitignore there before you commit."
+  fi
+}
+
 stage_wireguard() {
   local WG_IFACE="wg0"
-  local WG_SRC="${WG_CLIENT_CONF:-$HOME/wg-client.conf}"
+  local WG_SRC="${WG_CLIENT_CONF:-$CODE_DIR/UnoQ.conf}"
   local WG_EXTRA_NETS="192.168.80.0/22"  # LAN behind the server (Kyiv); "" for none
   local WG_KEEPALIVE=25
   local WG_FALLBACK_DNS=""                # "" = the LAN connection's gateway
@@ -1056,6 +1127,12 @@ stage_wireguard() {
   local unit="wg-quick@$WG_IFACE.service"
   local dropin="/etc/systemd/system/$unit.d/restart.conf"
   local conf_changed=0 dropin_changed=0 tmp
+
+  # The client config lives in ~/Code by default, so make sure that
+  # exists (and is yours) even when --wg runs on its own.
+  if [[ -z ${WG_CLIENT_CONF:-} ]]; then
+    ensure_code_dir
+  fi
 
   # ---- packages ----
 
@@ -1076,6 +1153,7 @@ stage_wireguard() {
   # ---- wg0.conf ----
 
   if [[ -f $WG_SRC ]]; then
+    wg_check_src_private "$WG_SRC"
     tmp="$(mktemp)"
     wg_render_client_conf "$WG_SRC" "$WG_EXTRA_NETS" "$WG_KEEPALIVE" > "$tmp"
     if write_if_changed "$conf" "$tmp" sudo; then
@@ -1090,7 +1168,7 @@ stage_wireguard() {
   elif sudo test -f "$conf"; then
     log "No $WG_SRC -- keeping the existing $conf"
   else
-    die "No client config at $WG_SRC. On the server: pivpn add -n <name>, then copy ~/configs/<name>.conf from there to $WG_SRC on this board (or set WG_CLIENT_CONF) and re-run."
+    die "No client config at $WG_SRC. On the server: pivpn add -n <name>. Then put the contents of ~/configs/<name>.conf from there into $WG_SRC on this board (install -m 600 /dev/null $WG_SRC && nano $WG_SRC), or set WG_CLIENT_CONF, and re-run."
   fi
 
   # ---- systemd: retry a failed start instead of staying down ----
@@ -1164,7 +1242,7 @@ WG_DROPIN
     hint "Restart HA so it uses the new DNS servers: docker restart homeassistant"
   fi
   if [[ -f $WG_SRC ]]; then
-    warn "$WG_SRC holds this board's private key. It's now in $conf (root-only); delete the copy: rm $WG_SRC"
+    hint "$WG_SRC holds this board's private key; keep it private (it's mode 600). Re-runs read it, and work from $conf if it's gone."
   fi
 }
 
@@ -1850,13 +1928,14 @@ stage_merge_partitions() {
 
 # merge-partitions must stay last -- see the comment above
 # stage_merge_partitions().
-STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools sudo github-ssh wireguard home-assistant merge-partitions)
+STAGE_IDS=(code-dir display-fix xfce-shortcuts zsh motd tools sudo github-ssh wireguard home-assistant merge-partitions)
 
 # Stages that never run by default: only when named by --only or by
 # their own flag.
 OPT_IN_STAGES=(wireguard home-assistant merge-partitions)
 
 declare -A STAGE_DESCRIPTIONS=(
+  [code-dir]="Create ~/Code, owned by you, for git clones and board files (UnoQ.conf)"
   [display-fix]="Force 1920x1080@60 on DP-1 (greeter service + XFCE profile)"
   [xfce-shortcuts]="Remap tile-window shortcuts from Super+keypad-arrow to Super+arrow"
   [zsh]="Install zsh + plugins, set as login shell, deploy .zshrc"
@@ -1870,6 +1949,7 @@ declare -A STAGE_DESCRIPTIONS=(
 )
 
 declare -A STAGE_FUNCS=(
+  [code-dir]=stage_code_dir
   [display-fix]=stage_display_fix
   [xfce-shortcuts]=stage_xfce_shortcuts
   [zsh]=stage_zsh
@@ -1905,7 +1985,7 @@ Options:
       --apps            Run just the tools (package installation) stage
       --github-ssh      Run just the github-ssh stage
       --wg              Run just the wireguard stage (opt-in; needs
-                        ~/wg-client.conf -- see stage_wireguard())
+                        ~/Code/UnoQ.conf -- see stage_wireguard())
       --ha              Run just the home-assistant stage (opt-in)
       --part            Run the next phase of merge-partitions (opt-in,
                         destructive -- see stage_merge_partitions())
