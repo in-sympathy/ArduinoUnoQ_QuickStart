@@ -253,8 +253,14 @@ preflight_checks() {
 
   command -v sudo >/dev/null 2>&1 || die "sudo is required but not found on PATH."
 
-  log "Requesting sudo access (you may be prompted for your password)"
-  sudo -v || die "Could not obtain sudo privileges."
+  # Try `sudo -n true` first: once the sudo stage has set up passwordless
+  # sudo, it succeeds without a prompt. `sudo -v` alone would still ask,
+  # because sudoers' default verifypw=all wants NOPASSWD on *every* rule
+  # matching you, and the image's own %sudo rule doesn't have it.
+  if ! sudo -n true 2>/dev/null; then
+    log "Requesting sudo access (you may be prompted for your password)"
+    sudo -v || die "Could not obtain sudo privileges."
+  fi
   start_sudo_keepalive
 }
 
