@@ -240,6 +240,19 @@ What the stage does, in order:
 6. Waits for the web UI to answer (first boot takes a few minutes on the
    A53 cores) and confirms the Matter server is listening on
    `127.0.0.1:5580` only — the stage fails if it's reachable from the LAN.
+7. Installs a NetworkManager hook that keeps both containers' DNS in step
+   with the board's, and restarts any container that's out of step right
+   away (see below).
+
+**Why the DNS hook.** With host networking, Docker copies the board's
+`/etc/resolv.conf` into a container only when the container starts. After
+a reboot where Wi-Fi comes up later than Docker — every blackout, since the
+router reboots too — HA starts with *no* DNS servers: LAN integrations keep
+working, but nothing online does, until HA is restarted. The hook
+(`/etc/NetworkManager/dispatcher.d/90-ha-dns-sync`) runs on network events
+(Wi-Fi up, DHCP or DNS changes) and restarts any of the two containers
+whose DNS servers no longer match the board's. Restarts are logged:
+`journalctl -t ha-dns-sync`.
 
 Then finish in the browser:
 
@@ -433,5 +446,10 @@ whole script a no-op when nothing's different.
   reflash brings the service back along with the original layout.
 - Keep the script's line endings as LF. A copy saved with Windows (CRLF)
   line endings won't run under bash at all.
+- HA works on the LAN but can't reach anything online? Check its DNS
+  copy: `docker exec homeassistant grep nameserver /etc/resolv.conf`. Empty
+  means it started before the network had DNS; `docker restart
+  homeassistant matter-server` fixes it, and the `--ha` stage's DNS hook
+  normally does that for you.
 - Full log of each run: `~/.uno-q-deploy/logs/`. Partition-table backups
   from `--part` land there too.
