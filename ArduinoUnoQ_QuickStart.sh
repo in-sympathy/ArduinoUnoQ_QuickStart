@@ -869,6 +869,12 @@ SUDOERS_CONTENT
 # friction without a matching benefit. If you reuse this on a different
 # kind of deployment, reconsider this (and the sudo stage) specifically.
 
+# github_port_open <host> <port>
+# Succeeds if <host> accepts a TCP connection on <port> within 5 seconds.
+github_port_open() {
+  timeout 5 bash -c '</dev/tcp/$0/$1' "$1" "$2" 2>/dev/null
+}
+
 stage_github_ssh() {
   local ssh_dir="$HOME/.ssh"
   mkdir -p "$ssh_dir"
@@ -931,6 +937,38 @@ stage_github_ssh() {
       echo "    StrictHostKeyChecking accept-new"
       echo "$marker_end"
     } >> "$config_file"
+  fi
+
+  # Some networks block outbound port 22 (the lab's Uzhgorod connection
+  # does), so `ssh git@github.com` hangs until it times out. GitHub also
+  # serves SSH on port 443 at ssh.github.com. If 22 gets no answer but 443
+  # does, route github.com there in a second managed block, so
+  # git@github.com:... remotes keep working unchanged. Port 443 works on
+  # every network, so the block stays even if the board moves somewhere
+  # that allows 22. A github.com -> port 443 setting you added yourself is
+  # detected via `ssh -G` and left as it is.
+  local p443_begin="# >>> deploy-uno-q.sh managed block: github.com over port 443 >>>"
+  local p443_end="# <<< deploy-uno-q.sh managed block: github.com over port 443 <<<"
+  local eff_host eff_port
+  eff_host="$(ssh -G github.com 2>/dev/null | awk '$1 == "hostname" {print $2; exit}')"
+  eff_port="$(ssh -G github.com 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+  if [[ $eff_host == "ssh.github.com" && $eff_port == "443" ]]; then
+    log "github.com already goes over port 443 (ssh.github.com)"
+  elif github_port_open github.com 22; then
+    log "GitHub answers on port 22 here -- no port change needed"
+  elif github_port_open ssh.github.com 443; then
+    log "Port 22 to GitHub gets no answer on this network -- routing github.com over port 443 (ssh.github.com) in $config_file"
+    {
+      echo
+      echo "$p443_begin"
+      echo "Host github.com"
+      echo "    HostName ssh.github.com"
+      echo "    Port 443"
+      echo "    User git"
+      echo "$p443_end"
+    } >> "$config_file"
+  else
+    warn "GitHub answers on neither port 22 nor port 443 (ssh.github.com) right now. Check this board's internet connection, then re-run: $SCRIPT_NAME --github-ssh"
   fi
 
   log "Public key ($(basename "$pub_key")):"
