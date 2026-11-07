@@ -25,7 +25,7 @@
 #                       highlighting, make it the login shell, deploy .zshrc.
 #   4. motd             Install the NIVROKU /etc/motd banner.
 #   5. tools            apt update && full-upgrade (kernel included --
-#                       this board only tracks Arduino-provided repos),
+#                       the kernel this board boots is Arduino's build),
 #                       install fastfetch, sysbench, btop, flashrom, and
 #                       Ookla Speedtest CLI.                     [--apps]
 #   6. sudo             Passwordless sudo for the invoking user, via a
@@ -36,11 +36,17 @@
 #
 # Opt-in stages (NEVER part of a default run -- they only run when
 # selected by their flag or by --only):
-#   8. home-assistant   Home Assistant Container + the matter.js Matter
+#   8. wireguard        Always-on WireGuard client to the lab's PiVPN
+#                       server, built from the client config PiVPN
+#                       generated for this board (~/wg-client.conf):
+#                       userspace wireguard-go, split tunnel, keepalive,
+#                       Pi-hole as DNS with the LAN gateway as fallback.
+#                                                                 [--wg]
+#   9. home-assistant   Home Assistant Container + the matter.js Matter
 #                       server as one docker compose project in
 #                       ~/homeassistant, Matter API on loopback only.
 #                                                                 [--ha]
-#   9. merge-partitions Fold the separate userdata (/home/arduino)
+#  10. merge-partitions Fold the separate userdata (/home/arduino)
 #                       partition into rootfs, so the whole eMMC is one
 #                       root filesystem. Destructive, spans two reboots:
 #                       each run detects where the board is and does the
@@ -56,9 +62,11 @@
 #     display-fix stage can seed the XFCE display profile. Over SSH the
 #     greeter-level fix still installs fine; re-run with
 #     --only display-fix from the desktop afterwards to finish that part.
-#   * home-assistant and merge-partitions don't need the desktop and run
-#     fine over SSH. merge-partitions does need an interactive terminal:
-#     it asks for a typed "yes" before deleting the userdata partition.
+#   * wireguard, home-assistant and merge-partitions don't need the
+#     desktop and run fine over SSH. merge-partitions does need an
+#     interactive terminal: it asks for a typed "yes" before deleting the
+#     userdata partition. wireguard needs this board's PiVPN client
+#     config at ~/wg-client.conf (or WG_CLIENT_CONF=/path/to/file).
 #
 # USAGE
 #   chmod +x deploy-uno-q.sh
@@ -67,6 +75,7 @@
 #   ./deploy-uno-q.sh --only zsh          # run just one stage
 #   ./deploy-uno-q.sh --skip motd,tools   # run everything except these
 #   ./deploy-uno-q.sh --screen --apps     # combine flags to run several
+#   ./deploy-uno-q.sh --wg                # connect to the PiVPN server
 #   ./deploy-uno-q.sh --ha                # install Home Assistant
 #   ./deploy-uno-q.sh --part              # next phase of the partition merge
 #   ./deploy-uno-q.sh --help
@@ -639,11 +648,15 @@ stage_tools() {
   log "Repairing any half-configured packages (dpkg --configure -a)"
   sudo dpkg --configure -a 2>&1 | tee -a "$LOG_DIR/updates.log"
 
-  # Kernel packages are NOT held here -- this lab only tracks
-  # Arduino-provided repos, so a kernel bump is an Arduino release, not
-  # an untested swap from a generic Debian mirror. If an earlier run of
-  # this script left any kernel package held, release it so full-upgrade
-  # actually updates it like everything else.
+  # Kernel packages are NOT held here -- the kernel this board boots is
+  # Arduino's own build, from Arduino's repo, so a kernel bump is an
+  # Arduino release, not an untested swap for a generic Debian kernel.
+  # (Debian's own archive is enabled on this image too -- trixie and
+  # trixie-backports from deb.debian.org -- which is why other stages
+  # install with --no-install-recommends where a Recommends could pull
+  # in a Debian kernel.) If an earlier run of this script left any
+  # kernel package held, release it so full-upgrade actually updates it
+  # like everything else.
   local kernel_pkgs
   kernel_pkgs="$(dpkg-query -W -f='${Package}\n' 'linux-image*' 'linux-headers*' 'linux-modules*' 2>/dev/null || true)"
   if [[ -n "$kernel_pkgs" ]]; then
@@ -873,6 +886,286 @@ stage_github_ssh() {
   hint "Add it at:  https://github.com/settings/ssh/new"
   hint "Then test:  ssh -T git@github.com"
   hint "Git remotes need the SSH form for this key to be used: git@github.com:user/repo.git (not https://github.com/...)"
+}
+
+# ============================================================
+# Stage: wireguard  (OPT-IN -- never part of a default run)
+# ============================================================
+#
+# Connects the board to the lab's PiVPN server as an always-on WireGuard
+# client and makes Pi-hole, reached through the tunnel, the board's
+# first DNS server. The input is the client config PiVPN generates for
+# this board: create the peer on the server (`pivpn add -n <name>`),
+# copy ~/configs/<name>.conf from there to ~/wg-client.conf here (or set
+# WG_CLIENT_CONF=/path/to/file). Keys never live in this script.
+#
+# Decisions baked in:
+#
+#   * Arduino's kernel is built without WireGuard (`modprobe wireguard`
+#     fails), so this uses wireguard-go, WireGuard's official userspace
+#     implementation. wg-quick switches to it by itself when the kernel
+#     module is missing, so the config file and the wg-quick@ unit are
+#     the standard ones. Slower than the kernel module; plenty for HA.
+#   * Both packages install with --no-install-recommends. wireguard-tools
+#     recommends the kernel-module package, which Debian can satisfy with
+#     a Debian kernel image -- and this image pulls from deb.debian.org.
+#   * Split tunnel. PiVPN generates AllowedIPs = 0.0.0.0/0, ::0/0; that
+#     becomes the tunnel subnet plus WG_EXTRA_NETS (the LAN behind the
+#     server). A full tunnel would cut the board off the internet
+#     whenever the server end is down, and would push its IPv6 default
+#     route -- which Matter runs on -- into a tunnel with no IPv6.
+#   * The server's LAN is in AllowedIPs so devices on it can reach this
+#     board: WireGuard drops packets from sources outside AllowedIPs, and
+#     replies to them would otherwise leave through the local internet.
+#     Those devices also need a route to the tunnel subnet via the
+#     server -- a static route on that LAN's router.
+#   * PersistentKeepalive = 25. The board sits behind NAT; without
+#     regular traffic the mapping expires, and the server side can't
+#     reach the board until the board happens to send something first.
+#   * DNS is set through NetworkManager, not wg-quick: wg-quick's DNS=
+#     needs resolvconf and would fight NetworkManager over
+#     /etc/resolv.conf. The DNS server from the client config (Pi-hole)
+#     goes first on the LAN connection and the LAN's gateway second, so
+#     a tunnel or server outage makes lookups slower instead of failing
+#     them. The value is kept as a comment in the generated wg0.conf, so
+#     a re-run still knows it after you delete ~/wg-client.conf.
+#   * wg-quick@<iface> gets Restart=on-failure, so a failed start at
+#     boot is retried instead of leaving the tunnel down.
+
+# wg_conf_get <file> <section> <key>
+# First value of <key> in [<section>] of a WireGuard config; empty if absent.
+wg_conf_get() {
+  awk -v want_sec="$2" -v want_key="$3" '
+    { line = $0; sub(/#.*/, "", line) }
+    line ~ /^[[:space:]]*\[/ { sec = line; gsub(/[][[:space:]]/, "", sec); next }
+    tolower(sec) == tolower(want_sec) && index(line, "=") {
+      k = substr(line, 1, index(line, "=") - 1)
+      v = substr(line, index(line, "=") + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      if (tolower(k) == tolower(want_key)) { print v; exit }
+    }' "$1"
+}
+
+# wg_ipv4_network <a.b.c.d/len>  ->  network address, e.g. 10.233.27.0/24
+wg_ipv4_network() {
+  local ip="${1%/*}" len="${1#*/}" a b c d n mask
+  IFS=. read -r a b c d <<< "$ip"
+  n=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+  mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  n=$(( n & mask ))
+  printf '%d.%d.%d.%d/%d\n' $(( (n >> 24) & 255 )) $(( (n >> 16) & 255 )) \
+    $(( (n >> 8) & 255 )) $(( n & 255 )) "$len"
+}
+
+# wg_render_client_conf <pivpn_client_conf> <extra_nets> <keepalive>
+# Prints this board's wg-quick config: keys, Address, Endpoint and MTU
+# kept; DNS kept only as a comment (applied via NetworkManager instead);
+# AllowedIPs replaced with the split-tunnel list; keepalive set.
+wg_render_client_conf() {
+  local src="$1" extra_nets="$2" keepalive="$3"
+  local priv addr mtu dns pub psk endpoint allowed peers
+
+  priv="$(wg_conf_get "$src" Interface PrivateKey)"
+  addr="$(wg_conf_get "$src" Interface Address)"
+  mtu="$(wg_conf_get "$src" Interface MTU)"
+  dns="$(wg_conf_get "$src" Interface DNS)"
+  pub="$(wg_conf_get "$src" Peer PublicKey)"
+  psk="$(wg_conf_get "$src" Peer PresharedKey)"
+  endpoint="$(wg_conf_get "$src" Peer Endpoint)"
+  peers="$(grep -ci '^[[:space:]]*\[peer\]' "$src" || true)"
+
+  [[ -n $priv && -n $pub && -n $endpoint ]] \
+    || die "$src is missing PrivateKey, the server's PublicKey or Endpoint -- is it the full client config from the server (keys included)?"
+  [[ "$peers" == 1 ]] || die "$src has $peers [Peer] sections; expected exactly one (the server)."
+  [[ $addr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] \
+    || die "$src: Address must be one IPv4 address with its prefix (e.g. 10.233.27.98/24); got '$addr'."
+
+  allowed="$(wg_ipv4_network "$addr")"
+  extra_nets="${extra_nets// /}"
+  if [[ -n $extra_nets ]]; then
+    allowed+=", ${extra_nets//,/, }"
+  fi
+  dns="${dns// /}"
+
+  echo "# Generated by deploy-uno-q.sh (wireguard stage) -- re-run that stage to change it."
+  if [[ -n $dns ]]; then
+    echo "# DNS = $dns (applied through NetworkManager, not wg-quick)"
+  fi
+  echo "[Interface]"
+  echo "PrivateKey = $priv"
+  echo "Address = $addr"
+  if [[ -n $mtu ]]; then
+    echo "MTU = $mtu"
+  fi
+  echo
+  echo "[Peer]"
+  echo "PublicKey = $pub"
+  if [[ -n $psk ]]; then
+    echo "PresharedKey = $psk"
+  fi
+  echo "Endpoint = $endpoint"
+  echo "AllowedIPs = $allowed"
+  echo "PersistentKeepalive = $keepalive"
+}
+
+# wg_apply_dns <primary[,primary2]> <fallback>
+# Puts the given DNS servers first on the NetworkManager connection that
+# carries the default route, followed by <fallback> (empty = that
+# connection's gateway). Leaves the connection alone if already set.
+wg_apply_dns() {
+  local primary="$1" fallback="$2" dev con want
+  dev="$(ip route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
+  [[ -n $dev ]] || die "No default route -- can't tell which connection should get the DNS servers."
+  con="$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null || true)"
+  [[ -n $con ]] || die "$dev isn't managed by NetworkManager -- set its DNS servers by hand: $primary first, then your router."
+  if [[ -z $fallback ]]; then
+    fallback="$(ip route show default dev "$dev" | awk '$2 == "via" {print $3; exit}')"
+  fi
+  want="$primary${fallback:+,$fallback}"
+
+  if [[ "$(nmcli -g ipv4.dns connection show "$con")" == "$want" \
+     && "$(nmcli -g ipv4.ignore-auto-dns connection show "$con")" == "yes" \
+     && "$(nmcli -g ipv6.ignore-auto-dns connection show "$con")" == "yes" ]]; then
+    log "DNS on '$con' ($dev) is already $want"
+    return 0
+  fi
+
+  log "Setting DNS on '$con' ($dev) to $want -- Pi-hole first, ${fallback:-nothing} as fallback"
+  sudo nmcli connection modify "$con" \
+    ipv4.dns "$want" ipv4.ignore-auto-dns yes ipv4.dns-options "timeout:2" \
+    ipv6.ignore-auto-dns yes
+  sudo nmcli device reapply "$dev"
+  sleep 2
+  if getent hosts deb.debian.org >/dev/null 2>&1; then
+    log "Name resolution works"
+  else
+    warn "Name resolution failed right after the DNS change. Check: grep nameserver /etc/resolv.conf"
+  fi
+}
+
+stage_wireguard() {
+  local WG_IFACE="wg0"
+  local WG_SRC="${WG_CLIENT_CONF:-$HOME/wg-client.conf}"
+  local WG_EXTRA_NETS="192.168.80.0/22"  # LAN behind the server (Kyiv); "" for none
+  local WG_KEEPALIVE=25
+  local WG_FALLBACK_DNS=""                # "" = the LAN connection's gateway
+  local WG_HANDSHAKE_TIMEOUT=30           # seconds
+
+  local conf="/etc/wireguard/$WG_IFACE.conf"
+  local unit="wg-quick@$WG_IFACE.service"
+  local dropin="/etc/systemd/system/$unit.d/restart.conf"
+  local conf_changed=0 dropin_changed=0 tmp
+
+  # ---- packages ----
+
+  local pkg missing=()
+  for pkg in wireguard-tools wireguard-go; do
+    if [[ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true)" != "install ok installed" ]]; then
+      missing+=("$pkg")
+    fi
+  done
+  if (( ${#missing[@]} )); then
+    ensure_apt_index_fresh
+    log "Installing ${missing[*]} (without recommends -- see stage_wireguard())"
+    sudo apt-get install -y --no-install-recommends "${missing[@]}"
+  else
+    log "wireguard-tools and wireguard-go already installed"
+  fi
+
+  # ---- wg0.conf ----
+
+  if [[ -f $WG_SRC ]]; then
+    tmp="$(mktemp)"
+    wg_render_client_conf "$WG_SRC" "$WG_EXTRA_NETS" "$WG_KEEPALIVE" > "$tmp"
+    if write_if_changed "$conf" "$tmp" sudo; then
+      conf_changed=1
+      log "Wrote $conf from $WG_SRC"
+    else
+      log "$conf already up to date"
+    fi
+    rm -f "$tmp"
+    sudo chown root:root "$conf"
+    sudo chmod 600 "$conf"
+  elif sudo test -f "$conf"; then
+    log "No $WG_SRC -- keeping the existing $conf"
+  else
+    die "No client config at $WG_SRC. On the server: pivpn add -n <name>, then copy ~/configs/<name>.conf from there to $WG_SRC on this board (or set WG_CLIENT_CONF) and re-run."
+  fi
+
+  # ---- systemd: retry a failed start instead of staying down ----
+
+  tmp="$(mktemp)"
+  cat > "$tmp" <<'WG_DROPIN'
+# Auto-generated by deploy-uno-q.sh (wireguard stage)
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=30
+WG_DROPIN
+  sudo mkdir -p "${dropin%/*}"
+  if write_if_changed "$dropin" "$tmp" sudo; then
+    dropin_changed=1
+    sudo chmod 644 "$dropin"
+    sudo systemctl daemon-reload
+    log "Wrote $dropin"
+  fi
+  rm -f "$tmp"
+
+  # ---- up ----
+
+  sudo systemctl enable --quiet "$unit"
+  if (( conf_changed || dropin_changed )) || ! systemctl is-active --quiet "$unit"; then
+    if ip link show "$WG_IFACE" >/dev/null 2>&1 && ! systemctl is-active --quiet "$unit"; then
+      log "Taking down the $WG_IFACE that was brought up outside systemd"
+      sudo wg-quick down "$WG_IFACE" 2>&1 | tee -a "$RUN_LOG" || sudo ip link del "$WG_IFACE"
+    fi
+    log "Starting $unit (an SSH session through this tunnel drops for a few seconds)"
+    sudo systemctl restart "$unit"
+  else
+    log "$unit already running with this config"
+  fi
+
+  # Keepalive makes wireguard send right away, so a handshake follows fast.
+  local waited=0 hs=""
+  while :; do
+    hs="$(sudo wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}' || true)"
+    if [[ -n $hs && $hs != 0 ]]; then
+      break
+    fi
+    if (( waited >= WG_HANDSHAKE_TIMEOUT )); then
+      die "No handshake with the server after ${WG_HANDSHAKE_TIMEOUT}s. Check that the Endpoint in $conf is reachable from here, that the server still has this board's peer (pivpn -c), and that the config is this board's."
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  log "Tunnel up: handshake with the server OK"
+
+  # ---- DNS ----
+
+  local dns
+  dns="$(sudo sed -n 's/^# DNS = \([^ ]*\) .*/\1/p' "$conf" | head -n1)"
+  if [[ -n $dns ]]; then
+    wg_apply_dns "$dns" "$WG_FALLBACK_DNS"
+  else
+    log "The client config names no DNS server -- leaving DNS as it is"
+  fi
+
+  local addr
+  addr="$(sudo awk -F' = ' '$1 == "Address" {print $2; exit}' "$conf")"
+  hint "Check the tunnel:     sudo wg show $WG_IFACE"
+  hint "This board is ${addr%/*} on the tunnel; Pi-hole's query log shows it under that address."
+  if [[ -n $WG_EXTRA_NETS ]]; then
+    hint "To reach it from $WG_EXTRA_NETS, that LAN's router needs a static route: $(wg_ipv4_network "$addr") via the server's LAN address."
+  fi
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx homeassistant; then
+    hint "Restart HA so it uses the new DNS servers: docker restart homeassistant"
+  fi
+  if [[ -f $WG_SRC ]]; then
+    warn "$WG_SRC holds this board's private key. It's now in $conf (root-only); delete the copy: rm $WG_SRC"
+  fi
 }
 
 # ============================================================
@@ -1557,11 +1850,11 @@ stage_merge_partitions() {
 
 # merge-partitions must stay last -- see the comment above
 # stage_merge_partitions().
-STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools sudo github-ssh home-assistant merge-partitions)
+STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools sudo github-ssh wireguard home-assistant merge-partitions)
 
 # Stages that never run by default: only when named by --only or by
 # their own flag.
-OPT_IN_STAGES=(home-assistant merge-partitions)
+OPT_IN_STAGES=(wireguard home-assistant merge-partitions)
 
 declare -A STAGE_DESCRIPTIONS=(
   [display-fix]="Force 1920x1080@60 on DP-1 (greeter service + XFCE profile)"
@@ -1571,6 +1864,7 @@ declare -A STAGE_DESCRIPTIONS=(
   [tools]="apt update/full-upgrade (kernel included), install fastfetch, sysbench, btop, flashrom, speedtest"
   [sudo]="Passwordless sudo for the invoking user (validated sudoers.d drop-in)"
   [github-ssh]="Generate/reuse an ed25519 key for GitHub, print it with setup steps"
+  [wireguard]="WireGuard client to the PiVPN server (wireguard-go), split tunnel, Pi-hole DNS"
   [home-assistant]="Home Assistant + Matter server in Docker (~/homeassistant), Matter API on loopback"
   [merge-partitions]="Merge the userdata partition into rootfs (3 phases, reboot after phases 1 and 2)"
 )
@@ -1583,6 +1877,7 @@ declare -A STAGE_FUNCS=(
   [tools]=stage_tools
   [sudo]=stage_sudo
   [github-ssh]=stage_github_ssh
+  [wireguard]=stage_wireguard
   [home-assistant]=stage_home_assistant
   [merge-partitions]=stage_merge_partitions
 )
@@ -1609,18 +1904,20 @@ Options:
       --keyboard        Run just the xfce-shortcuts stage
       --apps            Run just the tools (package installation) stage
       --github-ssh      Run just the github-ssh stage
+      --wg              Run just the wireguard stage (opt-in; needs
+                        ~/wg-client.conf -- see stage_wireguard())
       --ha              Run just the home-assistant stage (opt-in)
       --part            Run the next phase of merge-partitions (opt-in,
                         destructive -- see stage_merge_partitions())
   -h, --help            Show this help and exit
 
-  --screen, --keyboard, --apps, --github-ssh, --ha and --part can be
-  combined with each other (and with --only/--skip) to run more than one
-  stage in a single pass.
+  --screen, --keyboard, --apps, --github-ssh, --wg, --ha and --part can
+  be combined with each other (and with --only/--skip) to run more than
+  one stage in a single pass.
 
-  home-assistant and merge-partitions are opt-in: a plain run, or a run
-  with only --skip, never includes them. They run only when selected by
-  --ha/--part or named in --only.
+  wireguard, home-assistant and merge-partitions are opt-in: a plain run,
+  or a run with only --skip, never includes them. They run only when
+  selected by --wg/--ha/--part or named in --only.
 
 Examples:
   ./$SCRIPT_NAME                     Run every default stage, in order
@@ -1628,6 +1925,7 @@ Examples:
   ./$SCRIPT_NAME --skip motd,tools   Run every default stage except motd + tools
   ./$SCRIPT_NAME --screen --apps     Run the display fix and tools stages
   ./$SCRIPT_NAME --github-ssh        Generate/print this board's GitHub key
+  ./$SCRIPT_NAME --wg                Connect to the PiVPN server (WireGuard)
   ./$SCRIPT_NAME --ha                Install Home Assistant + the Matter server
   ./$SCRIPT_NAME --part              Run the next phase of the partition merge
 USAGE
@@ -1676,6 +1974,10 @@ parse_args() {
         ;;
       --github-ssh)
         ONLY_STAGES+=(github-ssh)
+        shift
+        ;;
+      --wg)
+        ONLY_STAGES+=(wireguard)
         shift
         ;;
       --ha)
