@@ -7,7 +7,8 @@
 # firmware/image update: run this once per fresh flash and it brings the
 # board up to the standard lab image. Every stage checks its own work
 # first and skips anything already applied, so re-running the script (in
-# full or with --only/--skip/--screen/--keyboard/--apps) is always safe.
+# full or with --only/--skip/--screen/--keyboard/--apps/--ha/--part) is
+# always safe.
 #
 # Stages (run in this order by default):
 #   1. display-fix     Force 1920x1080@60 on DP-1 at the greeter AND inside
@@ -33,6 +34,19 @@
 #                       access, print the public key with setup steps.
 #                       Never touches GitHub itself.      [--github-ssh]
 #
+# Opt-in stages (NEVER part of a default run -- they only run when
+# selected by their flag or by --only):
+#   8. home-assistant   Home Assistant Container + the matter.js Matter
+#                       server as one docker compose project in
+#                       ~/homeassistant, Matter API on loopback only.
+#                                                                 [--ha]
+#   9. merge-partitions Fold the separate userdata (/home/arduino)
+#                       partition into rootfs, so the whole eMMC is one
+#                       root filesystem. Destructive, spans two reboots:
+#                       each run detects where the board is and does the
+#                       next phase -- see stage_merge_partitions().
+#                                                               [--part]
+#
 # REQUIREMENTS
 #   * Run as your normal desktop user -- NOT as root, NOT via sudo.
 #     The script calls sudo itself wherever it needs privilege. Running
@@ -42,14 +56,19 @@
 #     display-fix stage can seed the XFCE display profile. Over SSH the
 #     greeter-level fix still installs fine; re-run with
 #     --only display-fix from the desktop afterwards to finish that part.
+#   * home-assistant and merge-partitions don't need the desktop and run
+#     fine over SSH. merge-partitions does need an interactive terminal:
+#     it asks for a typed "yes" before deleting the userdata partition.
 #
 # USAGE
 #   chmod +x deploy-uno-q.sh
-#   ./deploy-uno-q.sh                     # run every stage, in order
+#   ./deploy-uno-q.sh                     # run every default stage, in order
 #   ./deploy-uno-q.sh --list              # show available stages
 #   ./deploy-uno-q.sh --only zsh          # run just one stage
 #   ./deploy-uno-q.sh --skip motd,tools   # run everything except these
 #   ./deploy-uno-q.sh --screen --apps     # combine flags to run several
+#   ./deploy-uno-q.sh --ha                # install Home Assistant
+#   ./deploy-uno-q.sh --part              # next phase of the partition merge
 #   ./deploy-uno-q.sh --help
 #
 # ADDING A NEW STAGE
@@ -57,6 +76,7 @@
 #      tunables as `local` variables inside the function so they can't
 #      collide with other stages' variables as more get added.
 #   2. Add its id to STAGE_IDS, in the position you want it to run.
+#      Add it to OPT_IN_STAGES too if it must never run by default.
 #   3. Add one line each to STAGE_DESCRIPTIONS and STAGE_FUNCS.
 #   The runner, logging, --only/--skip and --list all pick it up from
 #   there automatically -- nothing else to wire up.
@@ -193,6 +213,18 @@ write_if_changed() {
   fi
   "${as[@]}" cp "$tmp" "$dest"
   return 0
+}
+
+# confirm_on_tty <prompt>
+#
+# Asks on the controlling terminal and succeeds only on a literal "yes".
+# Reads /dev/tty rather than stdin so it still works when stdin is
+# redirected, and fails closed (returns 1) when there's no terminal to
+# ask on at all -- a destructive step must never be confirmed by default.
+confirm_on_tty() {
+  local reply=""
+  { printf '\n%s\nType yes to continue: ' "$1" > /dev/tty && read -r reply < /dev/tty; } 2>/dev/null || return 1
+  [[ "$reply" == "yes" ]]
 }
 
 # ============================================================
@@ -844,10 +876,692 @@ stage_github_ssh() {
 }
 
 # ============================================================
+# Stage: home-assistant  (OPT-IN -- never part of a default run)
+# ============================================================
+#
+# Home Assistant Container plus the Open Home Foundation Matter server,
+# as one docker compose project in ~/homeassistant. This is the setup
+# worked out by hand on uno-q-4gb, captured so a fresh flash gets the
+# same thing. Decisions baked in:
+#
+#   * Docker itself comes with the UNO Q image (App Lab runs its bricks
+#     in containers), so this stage never installs it -- running the
+#     get.docker.com script over an existing install can break it.
+#   * Both containers use host networking: mDNS discovery and Matter both
+#     need to sit directly on the LAN.
+#   * The Matter server is the matter.js one (ghcr.io/matter-js/
+#     matterjs-server). python-matter-server, which older guides still
+#     show, was archived at its final 8.1.2 release.
+#   * The Matter server listens on 127.0.0.1 only. Its WebSocket API has
+#     no authentication and by default binds every interface, so anything
+#     on the LAN could commission or remove devices on the fabric. HA
+#     reaches it on loopback: ws://127.0.0.1:5580/ws -- not "localhost",
+#     which can resolve to ::1 first and miss an IPv4-only listener.
+#   * --primary-interface pins Matter's link-local IPv6/mDNS traffic to
+#     the LAN interface; docker0 and App Lab's bridge/veth interfaces
+#     carry link-local addresses too. It's passed as a flag rather than
+#     an env var so it shows on the server's "Command line:" log line.
+#     The image's ENTRYPOINT is the whole `node ... MatterServer.js` call
+#     and its CMD is empty, so compose's `command:` is purely arguments.
+#   * stop_grace_period 60s: Docker's 10 s default can kill HA before it
+#     has closed its SQLite database cleanly.
+#   * TZ is set explicitly: the board's own clock runs in UTC.
+#   * The config dirs are created as you before compose runs; otherwise
+#     Docker creates bind-mount sources itself, owned by root.
+#
+# Re-running is a no-op once everything is up: compose.yaml is rewritten
+# only if its content changes, and `docker compose up -d` only pulls
+# missing images and recreates containers whose config changed. It never
+# updates images on its own -- the update command is in the hints.
+
+# Runs docker directly if this user can reach the daemon, otherwise via
+# sudo -- so the stage also works right after `usermod -aG docker`,
+# before the new group membership is active in the current login.
+HA_DOCKER_CMD=()
+ha_docker() {
+  if (( ${#HA_DOCKER_CMD[@]} == 0 )); then
+    if docker info >/dev/null 2>&1; then
+      HA_DOCKER_CMD=(docker)
+    else
+      HA_DOCKER_CMD=(sudo docker)
+    fi
+  fi
+  "${HA_DOCKER_CMD[@]}" "$@"
+}
+
+# ha_render_compose <tz> <iface> <disable_jemalloc: 0|1>
+# Prints the compose.yaml for the stage.
+ha_render_compose() {
+  local tz="$1" iface="$2" no_jemalloc="$3"
+  local jemalloc_line=""
+  if [[ "$no_jemalloc" == 1 ]]; then
+    jemalloc_line=$'\n      DISABLE_JEMALLOC: "true"'
+  fi
+  cat <<COMPOSE_YAML
+# Auto-generated by deploy-uno-q.sh (home-assistant stage). A re-run of
+# that stage replaces this file (keeping a timestamped .bak) if it differs.
+services:
+  homeassistant:
+    container_name: homeassistant
+    image: ghcr.io/home-assistant/home-assistant:stable
+    volumes:
+      - ./config:/config
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus:/run/dbus:ro
+    environment:
+      TZ: $tz$jemalloc_line
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  matter-server:
+    container_name: matter-server
+    image: ghcr.io/matter-js/matterjs-server:stable
+    command: ["--listen-address", "127.0.0.1", "--primary-interface", "$iface"]
+    volumes:
+      - ./matter:/data
+    network_mode: host
+    restart: unless-stopped
+COMPOSE_YAML
+}
+
+stage_home_assistant() {
+  local HA_DIR="$HOME/homeassistant"
+  local HA_TZ="Europe/Kyiv"
+  local HA_IFACE=""              # empty = the interface of the default route
+  local HA_IMAGE="ghcr.io/home-assistant/home-assistant:stable"
+  local MIN_DOCKER_MAJOR=23      # Home Assistant Container needs Docker Engine 23.0+
+  local PULL_HEADROOM_GB=4       # HA + Matter server images came to ~3.3 GB on uno-q-4gb
+  local START_TIMEOUT=600        # seconds to wait for the web UI; first boot takes minutes
+  local MATTER_TIMEOUT=60        # seconds to wait for the Matter server's listener
+
+  # ---- Docker present, new enough, with compose ----
+
+  command -v docker >/dev/null 2>&1 \
+    || die "Docker isn't installed. The UNO Q image normally ships it for App Lab -- this stage deliberately doesn't install Docker itself."
+  local server_ver
+  server_ver="$(ha_docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+  [[ -n "$server_ver" ]] || die "Docker is installed but the daemon isn't answering. Check: sudo systemctl status docker"
+  if (( ${server_ver%%.*} < MIN_DOCKER_MAJOR )); then
+    die "Docker Engine $server_ver is too old -- Home Assistant needs $MIN_DOCKER_MAJOR.0 or later."
+  fi
+  ha_docker compose version >/dev/null 2>&1 \
+    || die "The docker compose plugin is missing (Debian package: docker-compose)."
+  log "Docker Engine $server_ver with the compose plugin found (via: ${HA_DOCKER_CMD[*]})"
+
+  # ---- Host checks ----
+
+  if [[ -z "$HA_IFACE" ]]; then
+    HA_IFACE="$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
+  fi
+  [[ -n "$HA_IFACE" ]] || die "No default route, so no LAN interface to pin the Matter server to. Connect the board to the network, or set HA_IFACE in stage_home_assistant()."
+  log "Matter server will use $HA_IFACE"
+  if ! ip -6 addr show dev "$HA_IFACE" scope link 2>/dev/null | grep -q inet6; then
+    warn "$HA_IFACE has no IPv6 link-local address -- Matter needs IPv6 on the LAN interface."
+  fi
+
+  local no_jemalloc=0 page_size
+  page_size="$(getconf PAGESIZE)"
+  if [[ "$page_size" != 4096 ]]; then
+    no_jemalloc=1
+    warn "Page size is $page_size, not 4096 -- disabling HA's jemalloc allocator, which fails on larger pages."
+  fi
+
+  # ---- compose project ----
+
+  mkdir -p "$HA_DIR/config" "$HA_DIR/matter"
+  local tmp_compose
+  tmp_compose="$(mktemp)"
+  ha_render_compose "$HA_TZ" "$HA_IFACE" "$no_jemalloc" > "$tmp_compose"
+  if write_if_changed "$HA_DIR/compose.yaml" "$tmp_compose"; then
+    log "Wrote $HA_DIR/compose.yaml"
+  else
+    log "$HA_DIR/compose.yaml already up to date, skipping"
+  fi
+  rm -f "$tmp_compose"
+
+  local compose=(compose --project-directory "$HA_DIR" -f "$HA_DIR/compose.yaml")
+  ha_docker "${compose[@]}" config -q
+
+  # ---- Space, before a first pull ----
+
+  if ! ha_docker image inspect "$HA_IMAGE" >/dev/null 2>&1; then
+    local docker_root avail_kb
+    docker_root="$(ha_docker info -f '{{.DockerRootDir}}')"
+    avail_kb="$(sudo df -Pk "$docker_root" | awk 'NR == 2 {print $4}')"
+    if (( avail_kb < PULL_HEADROOM_GB * 1024 * 1024 )); then
+      die "Only $((avail_kb / 1024 / 1024)) GB free under $docker_root; the first pull needs about $PULL_HEADROOM_GB GB. Free some space (unused App Lab brick images: docker image prune -a; or merge the partitions: $SCRIPT_NAME --part) and re-run."
+    fi
+  fi
+
+  # ---- Ports: free, or already ours ----
+
+  local port name
+  for port in 8123 5580; do
+    case "$port" in
+      8123) name="homeassistant" ;;
+      5580) name="matter-server" ;;
+    esac
+    if [[ -z "$(ha_docker ps -q --filter "name=^${name}\$" --filter status=running)" ]] \
+       && [[ -n "$(sudo ss -Htln "sport = :$port")" ]]; then
+      die "Port $port is already taken by something other than the $name container: $(sudo ss -Htlnp "sport = :$port")"
+    fi
+  done
+
+  # ---- Up ----
+
+  log "Starting Home Assistant and the Matter server (a first run pulls ~3 GB of images)"
+  ha_docker "${compose[@]}" up -d 2>&1 | tee -a "$RUN_LOG"
+
+  log "Waiting for Home Assistant's web UI (first boot takes a few minutes)"
+  local waited=0
+  until curl -s -o /dev/null http://127.0.0.1:8123; do
+    if (( waited >= START_TIMEOUT )); then
+      die "Home Assistant didn't answer on port 8123 within ${START_TIMEOUT}s. Check: docker logs --tail 50 homeassistant"
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  log "Home Assistant is answering on port 8123"
+
+  local matter_listen=""
+  waited=0
+  until matter_listen="$(sudo ss -Htln 'sport = :5580' | awk '{print $4}')" && [[ -n "$matter_listen" ]]; do
+    if (( waited >= MATTER_TIMEOUT )); then
+      die "The Matter server isn't listening on port 5580 after ${MATTER_TIMEOUT}s. Check: docker logs matter-server"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [[ "$matter_listen" != "127.0.0.1:5580" ]]; then
+    die "The Matter server is listening on '$matter_listen' instead of 127.0.0.1:5580 only -- its API would be reachable from the LAN. Check $HA_DIR/compose.yaml."
+  fi
+  log "Matter server is listening on loopback only ($matter_listen)"
+
+  local ip
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  hint "Onboarding:            http://${ip:-<board-ip>}:8123"
+  hint "Matter integration:    Settings > Devices & services > Add integration > Matter, URL ws://127.0.0.1:5580/ws"
+  hint "Matter dashboard (PC): ssh -L 5580:127.0.0.1:5580 $(id -un)@${ip:-<board-ip>}, then open http://localhost:5580"
+  hint "Update later:          cd $HA_DIR && docker compose pull && docker compose up -d && docker image prune -f"
+}
+
+# ============================================================
+# Stage: merge-partitions  (OPT-IN -- never part of a default run)
+# ============================================================
+#
+# Folds the separate "userdata" partition (mounted at /home/arduino) into
+# the "rootfs" partition, so the board runs on one root filesystem with
+# all of the eMMC's free space in one pool instead of two fixed halves.
+# Trade-off: arduino-flasher-cli's --preserve-user can't be used on a
+# merged board -- there's no user partition left to preserve -- so any
+# future reflash is a full wipe. Back up /home/arduino first.
+#
+# This is the script's only destructive stage, so it's opt-in, and it's
+# LAST in STAGE_IDS: anything else selected in the same run writes into
+# home BEFORE home is copied, not into a userdata partition that's about
+# to be thrown away.
+#
+# The work spans two reboots, so each run inspects the board and does
+# only the next phase:
+#
+#   Phase 1  userdata is still mounted at /home/arduino
+#            -> copy it onto rootfs, stop mounting it at boot. Reboot.
+#   Phase 2  userdata exists but is no longer mounted
+#            -> typed confirmation, delete userdata, grow rootfs over its
+#               space. Reboot.
+#   Phase 3  no userdata, rootfs runs to the end of the disk
+#            -> grow the filesystem if it doesn't fill the partition yet,
+#               mask debos-grow-rootfs. Running it again from here on just
+#               re-confirms everything and changes nothing.
+#
+# Design decisions worth knowing before changing anything here:
+#
+#   * Partition state is always read from the ON-DISK table (sfdisk -d),
+#     never from lsblk or sysfs. Once the table is rewritten with root
+#     mounted, the kernel keeps its old view until reboot, so lsblk would
+#     still show a partition that's already gone.
+#   * Partitions are found by GPT name ("rootfs"/"userdata") and by what
+#     / is mounted from -- never by number, which differs between images.
+#     The stage refuses any layout other than "userdata starts right
+#     after rootfs and is the last partition on the disk".
+#   * The copy goes through a bind mount of /, which exposes rootfs's own
+#     /home/arduino directory -- normally hidden under the userdata mount.
+#     That allows copying while you're logged in, without unmounting home.
+#   * rsync's source is the mount point itself, so -x keeps it inside the
+#     userdata filesystem. (The forum guide's `rsync -x /home/ ...` copies
+#     NOTHING on this layout: -x stops at the /home/arduino mount point
+#     and leaves an empty directory.)
+#   * rootfs is grown with `sfdisk -N <n>`, which changes only the size and
+#     keeps the partition's GUID, name, type and attributes. Deleting and
+#     recreating it in fdisk would lose all four. Boot finds root by
+#     filesystem UUID, which neither approach touches.
+#   * sfdisk's exit status isn't what decides success for the two table
+#     writes: with root mounted, the kernel's refusal to re-read the table
+#     is expected. After each write the on-disk table is read back and
+#     checked field by field, and restored from a backup taken just before
+#     the write if anything is off.
+#   * Docker is stopped for the copy by stopping the daemon, not the
+#     containers. A daemon shutdown doesn't count as a manual stop, so
+#     containers with restart: unless-stopped come back after the reboot.
+
+# ---- On-disk GPT helpers. Each takes the output of `sfdisk -d <disk>`
+# ---- as $1, so a run can read the table once and query it many times.
+
+# Entry line for the partition with GPT name $2 (empty if none).
+merge_gpt_entry_by_name() {
+  grep -E "[ ,]name=\"$2\"" <<< "$1" || true
+}
+
+# Entry line for partition device $2, e.g. /dev/mmcblk0p68 (empty if none).
+merge_gpt_entry_by_dev() {
+  grep -E "^$2 :" <<< "$1" || true
+}
+
+# Value of field $2 (start/size/type/uuid/name/attrs) in entry line $1,
+# quotes stripped.
+merge_gpt_field() {
+  sed -nE "s/.*[ ,]$2= *(\"[^\"]*\"|[^,]*).*/\1/p" <<< "$1" | tr -d '"'
+}
+
+merge_gpt_header() {
+  sed -n "s/^$2: *//p" <<< "$1"
+}
+
+# Highest start sector of any partition, i.e. where the last one starts.
+merge_gpt_max_start() {
+  sed -nE 's|^/dev/[^ ]+ : start= *([0-9]+),.*|\1|p' <<< "$1" | sort -n | tail -n1
+}
+
+# ---- fstab helpers (file argument defaults to /etc/fstab) ----
+
+# Succeeds if the file has an uncommented entry mounting at $1. Trailing
+# slashes are ignored -- this image's fstab says "/home/arduino/".
+merge_fstab_has_active_entry() {
+  awk -v mp="$1" '
+    /^[[:space:]]*#/ { next }
+    { m = $2; if (m != "/") sub(/\/+$/, "", m); if (m == mp) found = 1 }
+    END { exit !found }
+  ' "${2:-/etc/fstab}"
+}
+
+# Prints the file with every uncommented entry mounting at $1 commented
+# out, and everything else byte-for-byte unchanged.
+merge_fstab_comment_out() {
+  awk -v mp="$1" '
+    /^[[:space:]]*#/ { print; next }
+    { m = $2; if (m != "/") sub(/\/+$/, "", m) }
+    m == mp { print "#" $0; next }
+    { print }
+  ' "${2:-/etc/fstab}"
+}
+
+# merge_restore_gpt <disk> <backup_file>
+merge_restore_gpt() {
+  local disk="$1" backup="$2"
+  warn "Restoring the partition table of $disk from $backup"
+  # The backup and the run log are this user's own files, so the shell
+  # (not sudo) opening them is intended.
+  # shellcheck disable=SC2024
+  sudo sfdisk --no-reread --wipe-partitions never "$disk" < "$backup" >>"$RUN_LOG" 2>&1 || true
+  if [[ "$(sudo sfdisk -d "$disk")" == "$(cat "$backup")" ]]; then
+    warn "Partition table restored exactly."
+  else
+    error "The restored table does NOT match the backup. Do not reboot. Compare: sudo sfdisk -d $disk  vs  $backup"
+  fi
+}
+
+# merge_grow_root <disk> <root_dev>
+#
+# Grows <root_dev> in place to the end of the disk. Takes its own backup
+# first and returns normally only if the new entry has the same start,
+# type, GUID, name and attributes as before and ends on the disk's last
+# usable sector; otherwise it restores the backup and dies.
+merge_grow_root() {
+  local disk="$1" root_dev="$2"
+  local root_partn="${root_dev##*[!0-9]}"
+  local before before_entry backup
+  before="$(sudo sfdisk -d "$disk")"
+  before_entry="$(merge_gpt_entry_by_dev "$before" "$root_dev")"
+  backup="$LOG_DIR/gpt-pre-grow-$(date +%Y%m%d-%H%M%S).sfdisk"
+  printf '%s\n' "$before" > "$backup"
+  log "Partition table backed up to $backup"
+
+  log "Growing partition $root_partn ($root_dev) to the end of the disk"
+  # shellcheck disable=SC2024  # the run log is this user's own file
+  echo ', +' | sudo sfdisk --no-reread --wipe-partitions never -N "$root_partn" "$disk" >>"$RUN_LOG" 2>&1 || true
+
+  local after after_entry last_lba problems=() f
+  after="$(sudo sfdisk -d "$disk")"
+  after_entry="$(merge_gpt_entry_by_dev "$after" "$root_dev")"
+  last_lba="$(merge_gpt_header "$after" last-lba)"
+
+  if [[ -z "$after_entry" ]]; then
+    problems+=("$root_dev is missing from the partition table")
+  else
+    for f in start type uuid name attrs; do
+      if [[ "$(merge_gpt_field "$after_entry" "$f")" != "$(merge_gpt_field "$before_entry" "$f")" ]]; then
+        problems+=("$f changed: '$(merge_gpt_field "$before_entry" "$f")' -> '$(merge_gpt_field "$after_entry" "$f")'")
+      fi
+    done
+    local start size end
+    start="$(merge_gpt_field "$after_entry" start)"
+    size="$(merge_gpt_field "$after_entry" size)"
+    end=$((start + size - 1))
+    if (( end != last_lba )); then
+      problems+=("ends at sector $end, not on the last usable sector $last_lba")
+    fi
+  fi
+
+  if (( ${#problems[@]} )); then
+    error "Growing $root_dev didn't produce the expected entry:"
+    local p
+    for p in "${problems[@]}"; do
+      error "  $p"
+    done
+    merge_restore_gpt "$disk" "$backup"
+    die "Rolled back to the table from just before the grow. sfdisk's output is in $RUN_LOG."
+  fi
+  log "Grown: $after_entry"
+}
+
+# Phase 1: copy the mounted userdata filesystem onto rootfs and stop
+# mounting it at boot.
+merge_phase_copy() {
+  local user_mnt="$1" bind_dir="$2" marker="$3" margin="$4" max_diffs="$5"
+  local dest="$bind_dir$user_mnt"
+
+  # Re-run after phase 1 but before its reboot: fstab no longer mounts
+  # userdata; it's only still mounted because nothing has rebooted yet.
+  if ! merge_fstab_has_active_entry "$user_mnt"; then
+    warn "Phase 1 is already done -- /etc/fstab no longer mounts $user_mnt; it's only still mounted until the next boot."
+    warn "Reboot, then run $SCRIPT_NAME --part again for phase 2."
+    return 0
+  fi
+
+  log "Phase 1 of 3: copying $user_mnt onto the root filesystem"
+
+  if ! command -v rsync >/dev/null 2>&1; then
+    ensure_apt_index_fresh
+    sudo apt install -y rsync
+  fi
+
+  if systemctl is-active --quiet docker.service || systemctl is-active --quiet docker.socket; then
+    log "Stopping Docker for the copy -- its containers come back on their own after the reboot"
+    sudo systemctl stop docker.socket docker.service
+  fi
+
+  sudo mkdir -p "$bind_dir"
+  mountpoint -q "$bind_dir" || sudo mount --bind / "$bind_dir"
+
+  # The directory under the userdata mount must be empty, or hold only our
+  # marker from an interrupted earlier run -- in which case rsync resumes.
+  if [[ -n "$(sudo ls -A "$dest")" ]] && ! sudo test -e "$dest/$marker"; then
+    die "$dest -- rootfs's own $user_mnt, normally hidden under the userdata mount -- already has content this stage didn't put there. Inspect it and move it aside, then re-run. Nothing was copied."
+  fi
+  sudo touch "$dest/$marker"
+
+  local need have avail
+  need="$(sudo du -sxB1 "$user_mnt" | cut -f1)"
+  have="$(sudo du -sxB1 "$dest" | cut -f1)"
+  avail="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+  if (( need - have + margin > avail )); then
+    die "Not enough room on / for the copy: $(numfmt --to=iec $((need - have))) still to copy plus $(numfmt --to=iec "$margin") headroom, but only $(numfmt --to=iec "$avail") free. Free some space on / (e.g. docker image prune -a) and re-run."
+  fi
+  log "Space check OK: $(numfmt --to=iec "$need") in $user_mnt, $(numfmt --to=iec "$avail") free on /"
+
+  # --delete makes an interrupted copy converge on an exact mirror when
+  # re-run. Safe here: $dest was just checked to hold nothing but this
+  # stage's own copy, and the marker is excluded so --delete keeps it.
+  # rsync exit 24 ("some files vanished") is normal for a live home --
+  # caches come and go mid-copy -- so it counts as success.
+  local rsync_opts=(-aHAXx --numeric-ids --delete --exclude=/lost+found --exclude="/$marker")
+  local pass rc
+  for pass in 1 2; do
+    log "Copying, pass $pass of 2$([[ "$pass" == 2 ]] && echo ' (whatever changed during pass 1)')"
+    rc=0
+    if [[ "$pass" == 1 ]]; then
+      sudo rsync "${rsync_opts[@]}" --info=progress2 "$user_mnt/" "$dest/" || rc=$?
+    else
+      sudo rsync "${rsync_opts[@]}" "$user_mnt/" "$dest/" || rc=$?
+    fi
+    (( rc == 0 || rc == 24 )) || die "rsync failed (exit $rc). Re-run to resume the copy; nothing has been deleted."
+  done
+
+  local diffs ndiffs
+  diffs="$(sudo rsync "${rsync_opts[@]}" -n --itemize-changes "$user_mnt/" "$dest/" || true)"
+  ndiffs="$(grep -c . <<< "$diffs" || true)"
+  if (( ndiffs > max_diffs )); then
+    log "Paths that still differ after two passes:"
+    printf '%s\n' "$diffs" | sed 's/^/    /' | tee -a "$RUN_LOG"
+    die "$ndiffs paths still differ (limit $max_diffs) -- something is still writing to $user_mnt. Stop it and re-run; the copy resumes where it left off."
+  elif (( ndiffs > 0 )); then
+    log "$ndiffs path(s) changed during the copy (live session files -- expected):"
+    printf '%s\n' "$diffs" | sed 's/^/    /' | tee -a "$RUN_LOG"
+  else
+    log "Copy verified: no differences"
+  fi
+  sudo rm -f "$dest/$marker"
+
+  [[ -e /etc/fstab.pre-merge ]] || sudo cp -a /etc/fstab /etc/fstab.pre-merge
+  local tmp_fstab
+  tmp_fstab="$(mktemp)"
+  merge_fstab_comment_out "$user_mnt" > "$tmp_fstab"
+  if write_if_changed /etc/fstab "$tmp_fstab" sudo; then
+    log "Commented out the $user_mnt entry in /etc/fstab (original kept as /etc/fstab.pre-merge)"
+  fi
+  rm -f "$tmp_fstab"
+  if merge_fstab_has_active_entry "$user_mnt"; then
+    die "/etc/fstab still mounts $user_mnt after the edit -- fix it by hand before rebooting."
+  fi
+  sudo systemctl daemon-reload
+
+  sudo umount "$bind_dir"
+  sudo rmdir "$bind_dir"
+
+  log "Phase 1 done: $user_mnt is on the root filesystem and won't be mounted from userdata after the next boot."
+  warn "Reboot now, then run: $SCRIPT_NAME --part   (phase 2 deletes the userdata partition)"
+  warn "Docker stays stopped until that reboot."
+  hint "To back out instead: sudo cp -a /etc/fstab.pre-merge /etc/fstab && sudo reboot"
+}
+
+# Phase 2: userdata exists but is no longer mounted -> delete it and grow
+# rootfs over its space.
+merge_phase_repartition() {
+  local disk="$1" root_dev="$2" user_dev="$3" dump="$4" user_mnt="$5" marker="$6"
+  local root_entry user_entry sector_size
+  root_entry="$(merge_gpt_entry_by_dev "$dump" "$root_dev")"
+  user_entry="$(merge_gpt_entry_by_dev "$dump" "$user_dev")"
+  sector_size="$(merge_gpt_header "$dump" sector-size)"
+
+  log "Phase 2 of 3: deleting the userdata partition and growing rootfs"
+
+  if merge_fstab_has_active_entry "$user_mnt"; then
+    die "$user_dev isn't mounted, but /etc/fstab still mounts $user_mnt -- the boot-time mount may have failed. Check 'journalctl -b' before going further. Nothing was changed."
+  fi
+  if [[ "$(findmnt -no TARGET -T "$user_mnt")" != "/" ]]; then
+    die "$user_mnt isn't on the root filesystem -- refusing to delete userdata."
+  fi
+  if sudo test -e "$user_mnt/$marker"; then
+    die "$user_mnt/$marker exists, so the phase 1 copy never finished -- refusing to delete userdata."
+  fi
+  if [[ -z "$(ls -A "$user_mnt")" ]]; then
+    die "$user_mnt on the root filesystem is empty -- the copy isn't there. Refusing to delete userdata."
+  fi
+
+  local user_size_h
+  user_size_h="$(numfmt --to=iec $(( $(merge_gpt_field "$user_entry" size) * ${sector_size:-512} )))"
+  if ! confirm_on_tty "About to DELETE partition $user_dev (GPT name \"userdata\", $user_size_h) on $disk and grow $root_dev over its space. Your home is already on the root filesystem. This can't be undone."; then
+    die "Not confirmed (or no terminal to ask on) -- nothing was changed. Re-run from an interactive terminal to continue."
+  fi
+
+  local backup
+  backup="$LOG_DIR/gpt-pre-merge-$(date +%Y%m%d-%H%M%S).sfdisk"
+  printf '%s\n' "$dump" > "$backup"
+  log "Partition table backed up to $backup. The original entries, worth keeping off the board:"
+  hint "$root_entry"
+  hint "$user_entry"
+
+  local user_partn="${user_dev##*[!0-9]}"
+  log "Deleting partition $user_partn ($user_dev)"
+  # shellcheck disable=SC2024  # the run log is this user's own file
+  sudo sfdisk --no-reread --delete "$disk" "$user_partn" >>"$RUN_LOG" 2>&1 || true
+
+  local after
+  after="$(sudo sfdisk -d "$disk")"
+  if [[ -n "$(merge_gpt_entry_by_dev "$after" "$user_dev")" ]]; then
+    die "$user_dev is still in the partition table -- the delete didn't apply (sfdisk's output is in $RUN_LOG). Nothing else was changed."
+  fi
+  if [[ "$(merge_gpt_entry_by_dev "$after" "$root_dev")" != "$root_entry" ]]; then
+    error "Deleting $user_dev also changed the $root_dev entry."
+    merge_restore_gpt "$disk" "$backup"
+    die "Rolled back to the original table."
+  fi
+  log "Deleted $user_dev from the partition table"
+
+  merge_grow_root "$disk" "$root_dev"
+
+  log "Phase 2 done."
+  warn "Reboot now, then run: $SCRIPT_NAME --part   (phase 3 grows the filesystem and finishes up)"
+}
+
+# Phase 3: no userdata left. Finishes the grow if an earlier run stopped
+# short, otherwise grows the filesystem into the partition and tidies up.
+merge_phase_finish() {
+  local disk="$1" root_dev="$2" dump="$3" bind_dir="$4"
+  local root_entry start size last_lba end sector_size
+  root_entry="$(merge_gpt_entry_by_dev "$dump" "$root_dev")"
+  start="$(merge_gpt_field "$root_entry" start)"
+  size="$(merge_gpt_field "$root_entry" size)"
+  last_lba="$(merge_gpt_header "$dump" last-lba)"
+  sector_size="$(merge_gpt_header "$dump" sector-size)"
+  end=$((start + size - 1))
+
+  if [[ "$(merge_gpt_max_start "$dump")" != "$start" ]]; then
+    die "There's no \"userdata\" partition, but rootfs isn't the last partition either -- not a layout this stage knows. Nothing was changed."
+  fi
+
+  if (( end != last_lba )); then
+    # userdata is already gone but the grow never happened (interrupted run).
+    log "Phase 2, resumed: rootfs ends at sector $end, the disk at $last_lba"
+    merge_grow_root "$disk" "$root_dev"
+    warn "Reboot now, then run: $SCRIPT_NAME --part   (phase 3 finishes up)"
+    return 0
+  fi
+
+  # /sys reports 512-byte units regardless of the device's sector size.
+  local kernel_bytes table_bytes
+  kernel_bytes=$(( $(cat "/sys/class/block/${root_dev##*/}/size") * 512 ))
+  table_bytes=$(( size * ${sector_size:-512} ))
+  if (( kernel_bytes != table_bytes )); then
+    warn "The partition table already has rootfs at full size, but the kernel is still using the old table."
+    warn "Reboot, then run: $SCRIPT_NAME --part   (phase 3 finishes up)"
+    return 0
+  fi
+
+  log "Phase 3 of 3: making sure the root filesystem fills its partition"
+  local out
+  if ! out="$(sudo resize2fs "$root_dev" 2>&1)"; then
+    printf '%s\n' "$out" | tee -a "$RUN_LOG"
+    die "resize2fs failed on $root_dev"
+  fi
+  printf '%s\n' "$out" >> "$RUN_LOG"
+  if grep -q 'Nothing to do' <<< "$out"; then
+    log "Filesystem already fills the partition (debos-grow-rootfs usually does this at boot)"
+  else
+    log "Filesystem grown to fill the partition"
+  fi
+
+  # debos-grow-rootfs comes from the image build and runs at boot. On this
+  # image it calls growpart on partition 2 -- a 3.5 MB firmware partition
+  # that can never grow -- then resize2fs on both filesystem UUIDs,
+  # including the deleted userdata one, which errors on every boot.
+  # Harmless, but it has nothing left to do, so it's masked. A reflash
+  # brings it back along with the original layout.
+  local grow_unit="debos-grow-rootfs.service" grow_state
+  grow_state="$(systemctl is-enabled "$grow_unit" 2>/dev/null || true)"
+  case "$grow_state" in
+    masked)        log "$grow_unit already masked" ;;
+    ""|not-found)  log "$grow_unit isn't on this image, nothing to mask" ;;
+    *)             sudo systemctl mask "$grow_unit"; log "Masked $grow_unit" ;;
+  esac
+
+  if mountpoint -q "$bind_dir"; then
+    sudo umount "$bind_dir"
+  fi
+  if [[ -d "$bind_dir" ]]; then
+    sudo rmdir "$bind_dir" 2>/dev/null || true
+  fi
+
+  log "Partitions merged: $(df -h --output=size,avail / | tail -n1 | awk '{print $1 " total, " $2 " free"}') on /"
+  hint "arduino-flasher-cli --preserve-user can't work on this board any more -- back up /home/arduino before any reflash."
+  hint "Once you're happy with the new layout: the commented userdata line in /etc/fstab and /etc/fstab.pre-merge can go."
+}
+
+stage_merge_partitions() {
+  local ROOT_LABEL="rootfs"
+  local USER_LABEL="userdata"
+  local USER_MNT="/home/arduino"
+  local BIND_DIR="/mnt/uno-q-merge-rootfs"
+  local MARKER=".uno-q-merge-in-progress"
+  local SPACE_MARGIN=$((1024 * 1024 * 1024))   # bytes to leave free on / after the copy
+  local MAX_LIVE_DIFFS=25                       # paths allowed to still differ after the copy
+
+  local root_dev disk dump root_entry user_entry user_dev
+  root_dev="$(readlink -f "$(findmnt -no SOURCE /)")"
+  disk="/dev/$(lsblk -no PKNAME "$root_dev")"
+  dump="$(sudo sfdisk -d "$disk")"
+
+  root_entry="$(merge_gpt_entry_by_dev "$dump" "$root_dev")"
+  [[ -n "$root_entry" ]] || die "Couldn't find $root_dev in the partition table of $disk."
+  if [[ "$(merge_gpt_field "$root_entry" name)" != "$ROOT_LABEL" ]]; then
+    die "/ is on $root_dev, but its GPT name isn't \"$ROOT_LABEL\" -- not the Arduino layout this stage knows. Nothing was changed."
+  fi
+
+  user_entry="$(merge_gpt_entry_by_name "$dump" "$USER_LABEL")"
+  if [[ -z "$user_entry" ]]; then
+    merge_phase_finish "$disk" "$root_dev" "$dump" "$BIND_DIR"
+    return 0
+  fi
+  user_dev="${user_entry%% *}"
+
+  # Only the layout this was written for: userdata starts on the sector
+  # right after rootfs ends and is the last partition on the disk, so
+  # growing rootfs to the end covers exactly userdata's old space.
+  local r_start r_size u_start u_size last_lba
+  r_start="$(merge_gpt_field "$root_entry" start)"
+  r_size="$(merge_gpt_field "$root_entry" size)"
+  u_start="$(merge_gpt_field "$user_entry" start)"
+  u_size="$(merge_gpt_field "$user_entry" size)"
+  last_lba="$(merge_gpt_header "$dump" last-lba)"
+  if (( u_start != r_start + r_size )) || (( u_start + u_size - 1 != last_lba )); then
+    die "userdata ($user_dev) isn't directly after rootfs at the end of the disk -- not the layout this stage knows. Nothing was changed."
+  fi
+
+  local user_target
+  user_target="$(findmnt -rno TARGET -S "$user_dev" | sed -n 1p || true)"
+  if [[ -n "$user_target" ]]; then
+    if [[ "$user_target" != "$USER_MNT" ]]; then
+      die "$user_dev is mounted at $user_target, not $USER_MNT -- not the layout this stage knows. Nothing was changed."
+    fi
+    merge_phase_copy "$USER_MNT" "$BIND_DIR" "$MARKER" "$SPACE_MARGIN" "$MAX_LIVE_DIFFS"
+  else
+    merge_phase_repartition "$disk" "$root_dev" "$user_dev" "$dump" "$USER_MNT" "$MARKER"
+  fi
+}
+
+# ============================================================
 # Stage registry -- add new stages here
 # ============================================================
 
-STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools sudo github-ssh)
+# merge-partitions must stay last -- see the comment above
+# stage_merge_partitions().
+STAGE_IDS=(display-fix xfce-shortcuts zsh motd tools sudo github-ssh home-assistant merge-partitions)
+
+# Stages that never run by default: only when named by --only or by
+# their own flag.
+OPT_IN_STAGES=(home-assistant merge-partitions)
 
 declare -A STAGE_DESCRIPTIONS=(
   [display-fix]="Force 1920x1080@60 on DP-1 (greeter service + XFCE profile)"
@@ -857,6 +1571,8 @@ declare -A STAGE_DESCRIPTIONS=(
   [tools]="apt update/full-upgrade (kernel included), install fastfetch, sysbench, btop, flashrom, speedtest"
   [sudo]="Passwordless sudo for the invoking user (validated sudoers.d drop-in)"
   [github-ssh]="Generate/reuse an ed25519 key for GitHub, print it with setup steps"
+  [home-assistant]="Home Assistant + Matter server in Docker (~/homeassistant), Matter API on loopback"
+  [merge-partitions]="Merge the userdata partition into rootfs (3 phases, reboot after phases 1 and 2)"
 )
 
 declare -A STAGE_FUNCS=(
@@ -867,6 +1583,8 @@ declare -A STAGE_FUNCS=(
   [tools]=stage_tools
   [sudo]=stage_sudo
   [github-ssh]=stage_github_ssh
+  [home-assistant]=stage_home_assistant
+  [merge-partitions]=stage_merge_partitions
 )
 
 # ============================================================
@@ -891,26 +1609,39 @@ Options:
       --keyboard        Run just the xfce-shortcuts stage
       --apps            Run just the tools (package installation) stage
       --github-ssh      Run just the github-ssh stage
+      --ha              Run just the home-assistant stage (opt-in)
+      --part            Run the next phase of merge-partitions (opt-in,
+                        destructive -- see stage_merge_partitions())
   -h, --help            Show this help and exit
 
-  --screen, --keyboard, --apps, and --github-ssh can be combined with
-  each other (and with --only/--skip) to run more than one stage in a
-  single pass.
+  --screen, --keyboard, --apps, --github-ssh, --ha and --part can be
+  combined with each other (and with --only/--skip) to run more than one
+  stage in a single pass.
+
+  home-assistant and merge-partitions are opt-in: a plain run, or a run
+  with only --skip, never includes them. They run only when selected by
+  --ha/--part or named in --only.
 
 Examples:
-  ./$SCRIPT_NAME                     Run every stage, in order
+  ./$SCRIPT_NAME                     Run every default stage, in order
   ./$SCRIPT_NAME --only display-fix  Run just the display fix
-  ./$SCRIPT_NAME --skip motd,tools   Run everything except motd + tools
+  ./$SCRIPT_NAME --skip motd,tools   Run every default stage except motd + tools
   ./$SCRIPT_NAME --screen --apps     Run the display fix and tools stages
   ./$SCRIPT_NAME --github-ssh        Generate/print this board's GitHub key
+  ./$SCRIPT_NAME --ha                Install Home Assistant + the Matter server
+  ./$SCRIPT_NAME --part              Run the next phase of the partition merge
 USAGE
 }
 
 list_stages() {
-  printf '%-14s %s\n' "ID" "DESCRIPTION"
-  local id
+  printf '%-17s %s\n' "ID" "DESCRIPTION"
+  local id tag
   for id in "${STAGE_IDS[@]}"; do
-    printf '%-14s %s\n' "$id" "${STAGE_DESCRIPTIONS[$id]}"
+    tag=""
+    if contains "$id" "${OPT_IN_STAGES[@]}"; then
+      tag="  [opt-in]"
+    fi
+    printf '%-17s %s%s\n' "$id" "${STAGE_DESCRIPTIONS[$id]}" "$tag"
   done
 }
 
@@ -947,6 +1678,14 @@ parse_args() {
         ONLY_STAGES+=(github-ssh)
         shift
         ;;
+      --ha)
+        ONLY_STAGES+=(home-assistant)
+        shift
+        ;;
+      --part)
+        ONLY_STAGES+=(merge-partitions)
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -980,6 +1719,10 @@ main() {
   local stages_to_run=()
   for id in "${STAGE_IDS[@]}"; do
     if (( ${#ONLY_STAGES[@]} )) && ! contains "$id" "${ONLY_STAGES[@]}"; then
+      continue
+    fi
+    # Opt-in stages never ride along with a plain or --skip-only run.
+    if contains "$id" "${OPT_IN_STAGES[@]}" && ! contains "$id" "${ONLY_STAGES[@]}"; then
       continue
     fi
     if contains "$id" "${SKIP_STAGES[@]}"; then
