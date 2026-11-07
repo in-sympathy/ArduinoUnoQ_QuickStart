@@ -1,4 +1,4 @@
-# deploy-uno-q.sh
+# ArduinoUnoQ_QuickStart
 
 Post-flash provisioning script for Arduino UNO Q boards. Run it once after
 flashing (or reflashing) a board and it brings the board up to a standard,
@@ -56,11 +56,14 @@ already-provisioned board is always safe and fast.
 
 ```bash
 mkdir -p ~/Code && cd ~/Code
-git clone <this-repo-url>
-cd <this-repo>
-chmod +x deploy-uno-q.sh
-./deploy-uno-q.sh
+git clone https://github.com/in-sympathy/ArduinoUnoQ_QuickStart.git
+cd ArduinoUnoQ_QuickStart
+chmod +x ArduinoUnoQ_QuickStart.sh
+./ArduinoUnoQ_QuickStart.sh
 ```
+
+Clone over HTTPS on a fresh board: it has no GitHub SSH key yet (the
+`github-ssh` stage sets that up), and some networks block SSH's port 22.
 
 That runs every default stage, in order. The first one, `code-dir`, makes
 sure `~/Code` exists and belongs to you (the `mkdir` above only gives the
@@ -69,7 +72,7 @@ out unless you ask for them (`--wg`, `--ha`, `--part`). To see what's
 available first:
 
 ```bash
-./deploy-uno-q.sh --list
+./ArduinoUnoQ_QuickStart.sh --list
 ```
 
 ## Stages
@@ -102,7 +105,7 @@ selected with their flag or named in `--only`.
 ## Options
 
 ```
-Usage: deploy-uno-q.sh [OPTIONS]
+Usage: ArduinoUnoQ_QuickStart.sh [OPTIONS]
 
   -l, --list            List available stages and exit
   -o, --only LIST       Run only these stages, comma-separated ids
@@ -127,16 +130,16 @@ of the tables above, whatever order the flags are given in.
 ## Examples
 
 ```bash
-./deploy-uno-q.sh                     # every default stage, in order
-./deploy-uno-q.sh --list              # see what's available
-./deploy-uno-q.sh --only zsh          # just one stage
-./deploy-uno-q.sh --skip motd,tools   # every default stage except these
-./deploy-uno-q.sh --screen --apps     # combine flags to run several stages
-./deploy-uno-q.sh --only sudo         # one-time: passwordless sudo setup
-./deploy-uno-q.sh --github-ssh        # generate/print this board's GitHub key
-./deploy-uno-q.sh --wg                # connect to the PiVPN server
-./deploy-uno-q.sh --ha                # install Home Assistant + the Matter server
-./deploy-uno-q.sh --part              # next phase of the partition merge
+./ArduinoUnoQ_QuickStart.sh                     # every default stage, in order
+./ArduinoUnoQ_QuickStart.sh --list              # see what's available
+./ArduinoUnoQ_QuickStart.sh --only zsh          # just one stage
+./ArduinoUnoQ_QuickStart.sh --skip motd,tools   # every default stage except these
+./ArduinoUnoQ_QuickStart.sh --screen --apps     # combine flags to run several stages
+./ArduinoUnoQ_QuickStart.sh --only sudo         # one-time: passwordless sudo setup
+./ArduinoUnoQ_QuickStart.sh --github-ssh        # generate/print this board's GitHub key
+./ArduinoUnoQ_QuickStart.sh --wg                # connect to the PiVPN server
+./ArduinoUnoQ_QuickStart.sh --ha                # install Home Assistant + the Matter server
+./ArduinoUnoQ_QuickStart.sh --part              # next phase of the partition merge
 ```
 
 ## WireGuard
@@ -160,7 +163,7 @@ puts Pi-hole (reached through the tunnel) first in its DNS settings.
    ```
 
    A different file name or place works too:
-   `WG_CLIENT_CONF=/path/to/file ./deploy-uno-q.sh --wg`. Run on its own,
+   `WG_CLIENT_CONF=/path/to/file ./ArduinoUnoQ_QuickStart.sh --wg`. Run on its own,
    `--wg` creates `~/Code` first if the default run hasn't yet.
 
 What the stage does:
@@ -277,7 +280,7 @@ merged board, because there's no user partition left to preserve. Any
 future reflash is a full wipe that restores Arduino's layout, so back up
 `~/homeassistant` (and anything else in home) before reflashing.
 
-Run `./deploy-uno-q.sh --part` three times, rebooting between runs. Each
+Run `./ArduinoUnoQ_QuickStart.sh --part` three times, rebooting between runs. Each
 run reads the partition table, works out where the board is, and does
 only the next phase:
 
