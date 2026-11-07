@@ -86,7 +86,7 @@ Stages run in this order by default. Skip or select individual ones with
 | 5 | `motd` | — | Installs the lab's `/etc/motd` banner. |
 | 6 | `tools` | `--apps` | `apt update && full-upgrade` (kernel included — the kernel this board boots is Arduino's own build, so a kernel bump here is an Arduino release, not an untested swap for a generic Debian kernel), plus `fastfetch`, `sysbench`, `btop`, `flashrom`, and the Ookla Speedtest CLI. |
 | 7 | `sudo` | — | Passwordless `sudo` for the invoking user, via a `/etc/sudoers.d/` drop-in that's syntax-validated with `visudo -c` *before* it's ever installed. |
-| 8 | `github-ssh` | `--github-ssh` | Generates (or reuses) an `ed25519` SSH key for this board and prints the public key with the steps to add it to GitHub. Never touches GitHub itself — registering the key is always a manual step. Safe to re-run any time just to get the public key back on screen. |
+| 8 | `github-ssh` | `--github-ssh` | Generates (or reuses) an `ed25519` SSH key for this board and prints the public key with the steps to add it to GitHub. Never touches GitHub itself — registering the key is always a manual step. If this network blocks port 22 to GitHub, routes `github.com` over GitHub's port-443 SSH (`ssh.github.com`) so `git@github.com:…` remotes still work. Safe to re-run any time just to get the public key back on screen. |
 
 ### Opt-in stages
 
@@ -403,6 +403,13 @@ whole script a no-op when nothing's different.
   block to `~/.ssh/config` (`StrictHostKeyChecking accept-new` for
   `github.com`) so that first connection doesn't hang on a host-key
   prompt; anything else already in that file is left untouched.
+- Some networks block outbound SSH on port 22 (the Uzhgorod connection
+  does): `ssh -T git@github.com` then just hangs. `github-ssh` checks for
+  this and, when 22 gets no answer but 443 does, adds a second managed
+  block sending `github.com` to `ssh.github.com` port 443 — GitHub's
+  official SSH-over-HTTPS-port endpoint. The block stays if the board
+  later moves to a network that allows 22, since 443 works everywhere. If
+  you've already set this up by hand, it's detected and left alone.
 - `--ha` rewrites `compose.yaml` whenever its content differs from what
   the stage generates (keeping a timestamped `.bak`), so make lasting
   changes in `stage_home_assistant()`, not by hand in the file.
